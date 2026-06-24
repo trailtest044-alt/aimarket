@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ai-digital-marketplace-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_SEED_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY_BASE64
+        sync: false
