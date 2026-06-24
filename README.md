@@ -123,3 +123,8 @@ npm start
 ## Important business/legal note
 
 Only sell digital products/accounts that you are allowed to resell. Many third-party services do not allow account/password resale. A safer model is to sell authorized license keys, redeem instructions, or officially permitted access.
+
+
+## Render Free admin setup
+
+Render Free does not support Shell access. This build includes a temporary `/api/setup/create-admin` route guarded by `ALLOW_ADMIN_SEED=true`. See `docs/RENDER_FREE_ADMIN_SETUP.md`. Disable it immediately after creating the first admin.
