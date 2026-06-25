@@ -36,8 +36,20 @@ export function priceForRegion(product, region) {
   return { amount: Number(product.priceUSDT || 0), currency: product.worldwideCurrency || 'USDT' };
 }
 
+export function allowedPaymentMethods(region) {
+  // Bangladesh customers see only Bangladesh gateway.
+  // Pakistan and worldwide customers can choose Pakistan payment or Binance.
+  if (region === 'bd') return ['bangladesh'];
+  return ['pakistan', 'binance'];
+}
+
+export function priceRegionForPaymentMethod(paymentMethod, detectedRegion = 'world') {
+  if (paymentMethod === 'bangladesh') return 'bd';
+  if (paymentMethod === 'pakistan') return 'pk';
+  if (paymentMethod === 'binance') return 'world';
+  return detectedRegion || 'world';
+}
+
 export function expectedPaymentMethod(region) {
-  if (region === 'bd') return 'bangladesh';
-  if (region === 'pk') return 'pakistan';
-  return 'binance';
+  return allowedPaymentMethods(region)[0];
 }

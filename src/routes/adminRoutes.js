@@ -315,6 +315,41 @@ adminRouter.get('/orders', asyncHandler(async (req, res) => {
   res.json({ orders });
 }));
 
+function searchRegex(value) {
+  return new RegExp(String(value).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+}
+
+adminRouter.get('/orders/search', asyncHandler(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const status = String(req.query.status || '').trim();
+  const limit = Math.min(Number(req.query.limit || 100), 500);
+  const query = {};
+  if (status && ['pending', 'approved', 'delivered', 'rejected'].includes(status)) query.status = status;
+  if (q) {
+    const re = searchRegex(q);
+    query.$or = [
+      { orderId: re },
+      { transactionId: re },
+      { customerOrderRef: re },
+      { 'customer.name': re },
+      { 'customer.email': re },
+      { 'customer.whatsapp': re },
+      { 'productSnapshot.title': re },
+      { paymentMethod: re },
+      { approvedByNickname: re },
+      { deliveredByNickname: re },
+      { rejectedByNickname: re },
+      { reviewedByNickname: re }
+    ];
+  }
+  const orders = await Order.find(query)
+    .populate('productId', 'title slug')
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
+  res.json({ orders });
+}));
+
 adminRouter.post('/orders/:orderId/approve', asyncHandler(async (req, res) => {
   const order = await Order.findOne({ orderId: req.params.orderId });
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -366,14 +401,31 @@ adminRouter.post('/orders/:orderId/reject', asyncHandler(async (req, res) => {
 adminRouter.post('/orders/:orderId/mark-delivered', asyncHandler(async (req, res) => {
   const order = await Order.findOne({ orderId: req.params.orderId });
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (!['approved', 'delivered'].includes(order.status)) return res.status(409).json({ error: `Order is ${order.status}` });
+  if (!['pending', 'approved', 'delivered'].includes(order.status)) return res.status(409).json({ error: `Order is ${order.status}` });
   const nick = req.admin.nickname || req.admin.name;
+
+  if (order.status === 'pending' && !order.assignedStockItemId) {
+    const stock = await StockItem.findOneAndUpdate(
+      { productId: order.productId, status: 'available' },
+      { status: 'delivered', assignedOrderId: order._id, deliveredAt: new Date() },
+      { new: true, sort: { createdAt: 1 } }
+    );
+    if (!stock) return res.status(409).json({ error: 'No available stock for this product' });
+    order.assignedStockItemId = stock._id;
+    order.approvedBy = req.admin._id;
+    order.approvedByNickname = nick;
+    order.approvedAt = new Date();
+    order.reviewedBy = req.admin._id;
+    order.reviewedByNickname = nick;
+    order.reviewedAt = new Date();
+  }
+
   order.status = 'delivered';
   order.deliveredBy = req.admin._id;
   order.deliveredByNickname = nick;
   order.deliveredAt = new Date();
   await order.save();
-  await logActivity(req.admin, 'order.delivered', 'order', order.orderId, `${nick} marked order ${order.orderId} delivered`);
+  await logActivity(req.admin, 'order.delivered', 'order', order.orderId, `${nick} approved and delivered order ${order.orderId}`);
   res.json({ message: 'Order marked delivered', order });
 }));
 

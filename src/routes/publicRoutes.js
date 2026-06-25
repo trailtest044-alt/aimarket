@@ -9,7 +9,7 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 import { createAccessToken, createOrderId, sha256 } from '../utils/tokens.js';
 import { decryptJson } from '../utils/cryptoBox.js';
 import { orderLimiter } from '../middleware/rateLimits.js';
-import { detectRegion, priceForRegion, expectedPaymentMethod } from '../utils/region.js';
+import { detectRegion, priceForRegion, allowedPaymentMethods, priceRegionForPaymentMethod } from '../utils/region.js';
 
 export const publicRouter = express.Router();
 
@@ -89,28 +89,38 @@ publicRouter.post('/orders', orderLimiter, asyncHandler(async (req, res) => {
   const available = await StockItem.countDocuments({ productId: product._id, status: 'available' });
   if (available <= 0) return res.status(409).json({ error: 'This product is out of stock' });
 
-  const { country, region } = detectRegion(req, data.priceRegion);
-  const expectedMethod = expectedPaymentMethod(region);
-  if (data.paymentMethod !== expectedMethod) {
-    return res.status(400).json({ error: `This region must use ${expectedMethod} payment.` });
+  const { country, region: detectedRegion } = detectRegion(req, data.priceRegion);
+  const allowedMethods = allowedPaymentMethods(detectedRegion);
+  if (!allowedMethods.includes(data.paymentMethod)) {
+    return res.status(400).json({ error: `This region can use only: ${allowedMethods.join(', ')}` });
   }
 
+  const duplicateQuery = [
+    { transactionId: data.transactionId.trim() }
+  ];
+  if (data.customerOrderRef?.trim()) duplicateQuery.push({ customerOrderRef: data.customerOrderRef.trim() });
+  const duplicate = await Order.findOne({ $or: duplicateQuery }).lean();
+  if (duplicate) {
+    return res.status(409).json({ error: 'This transaction/order reference is already submitted. Use Track Your Orders to check status.' });
+  }
+
+  const finalPriceRegion = priceRegionForPaymentMethod(data.paymentMethod, detectedRegion);
   const method = await PaymentMethod.findOne({ key: data.paymentMethod, isActive: true }).lean();
   if (!method) return res.status(400).json({ error: 'Payment method is not active' });
 
-  const price = priceForRegion(product, region);
+  const price = priceForRegion(product, finalPriceRegion);
   const accessToken = createAccessToken();
   const order = await Order.create({
     orderId: createOrderId(),
     productId: product._id,
-    productSnapshot: { title: product.title, price: price.amount, currency: price.currency, priceRegion: region },
+    productSnapshot: { title: product.title, price: price.amount, currency: price.currency, priceRegion: finalPriceRegion },
     customer: {
       name: data.customer.name.trim(),
       email: data.customer.email.toLowerCase().trim(),
       whatsapp: data.customer.whatsapp?.trim() || ''
     },
     paymentMethod: data.paymentMethod,
-    priceRegion: region,
+    priceRegion: finalPriceRegion,
     detectedCountry: country,
     transactionId: data.transactionId.trim(),
     customerOrderRef: data.customerOrderRef?.trim() || '',
@@ -129,13 +139,73 @@ publicRouter.post('/orders', orderLimiter, asyncHandler(async (req, res) => {
       productTitle: product.title,
       amount: price.amount,
       currency: price.currency,
-      priceRegion: region,
+      priceRegion: finalPriceRegion,
       paymentMethod: data.paymentMethod,
       transactionId: order.transactionId,
       customerOrderRef: order.customerOrderRef
     },
     accessToken
   });
+}));
+
+function publicOrderPayload(order, delivery = null) {
+  return {
+    orderId: order.orderId,
+    status: order.status,
+    product: order.productSnapshot,
+    productTitle: order.productSnapshot?.title || 'Product',
+    amount: order.productSnapshot?.price || 0,
+    currency: order.productSnapshot?.currency || 'USDT',
+    paymentMethod: order.paymentMethod,
+    priceRegion: order.priceRegion,
+    transactionId: order.transactionId,
+    customerOrderRef: order.customerOrderRef || '',
+    customer: {
+      name: order.customer?.name || '',
+      email: order.customer?.email || '',
+      whatsapp: order.customer?.whatsapp || ''
+    },
+    createdAt: order.createdAt,
+    reviewedAt: order.reviewedAt,
+    approvedByNickname: order.approvedByNickname || '',
+    deliveredByNickname: order.deliveredByNickname || '',
+    rejectedByNickname: order.rejectedByNickname || '',
+    reviewedByNickname: order.reviewedByNickname || '',
+    rejectReason: order.rejectReason || null,
+    deliveryAvailable: ['approved', 'delivered'].includes(order.status) && !!order.assignedStockItemId,
+    delivery
+  };
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+publicRouter.post('/track-orders', asyncHandler(async (req, res) => {
+  const { code } = z.object({ code: z.string().min(3).max(160) }).parse(req.body);
+  const clean = code.trim();
+  const exact = new RegExp(`^${escapeRegex(clean)}$`, 'i');
+  const orders = await Order.find({
+    $or: [
+      { orderId: exact },
+      { transactionId: exact },
+      { customerOrderRef: exact }
+    ]
+  }).sort({ createdAt: -1 }).limit(10);
+
+  const results = [];
+  for (const order of orders) {
+    let delivery = null;
+    if (['approved', 'delivered'].includes(order.status) && order.assignedStockItemId) {
+      const stock = await StockItem.findById(order.assignedStockItemId).lean();
+      if (stock) {
+        try { delivery = decryptJson(stock.encryptedPayload); } catch { delivery = null; }
+      }
+    }
+    results.push(publicOrderPayload(order, delivery));
+  }
+
+  res.json({ orders: results });
 }));
 
 publicRouter.get('/orders/:orderId/status', asyncHandler(async (req, res) => {
