@@ -19,9 +19,16 @@ export async function requireAdmin(req, res, next) {
   }
 }
 
+export function requireOwner(req, res, next) {
+  if (!req.admin || req.admin.role !== 'owner') {
+    return res.status(403).json({ error: 'Owner access required' });
+  }
+  next();
+}
+
 export function signAdminToken(admin) {
   return jwt.sign(
-    { sub: admin._id.toString(), role: admin.role, email: admin.email },
+    { sub: admin._id.toString(), role: admin.role, email: admin.email, nickname: admin.nickname || admin.name },
     env.jwtSecret,
     { expiresIn: '8h' }
   );

@@ -35,7 +35,8 @@ app.get('/api/setup/create-admin', async (req, res, next) => {
 
     const email = process.env.ADMIN_SETUP_EMAIL;
     const password = process.env.ADMIN_SETUP_PASSWORD;
-    const name = process.env.ADMIN_SETUP_NAME || 'Owner';
+    const name = process.env.ADMIN_SETUP_NAME || 'shimul';
+    const nickname = process.env.ADMIN_SETUP_NICKNAME || name;
 
     if (!email || !password || password.length < 10) {
       return res.status(400).json({
@@ -50,6 +51,7 @@ app.get('/api/setup/create-admin', async (req, res, next) => {
       { email: normalizedEmail },
       {
         name,
+        nickname,
         email: normalizedEmail,
         passwordHash,
         role: 'owner',

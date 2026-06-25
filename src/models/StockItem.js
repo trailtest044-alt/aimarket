@@ -15,7 +15,9 @@ const stockItemSchema = new mongoose.Schema({
   status: { type: String, enum: ['available', 'reserved', 'delivered', 'disabled'], default: 'available', index: true },
   assignedOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
   deliveredAt: Date,
-  adminNote: String
+  adminNote: String,
+  createdByAdminId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', default: null },
+  createdByNickname: { type: String, default: '' }
 }, { timestamps: true });
 
 stockItemSchema.index({ productId: 1, status: 1, createdAt: 1 });

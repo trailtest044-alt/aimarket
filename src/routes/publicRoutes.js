@@ -9,6 +9,7 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 import { createAccessToken, createOrderId, sha256 } from '../utils/tokens.js';
 import { decryptJson } from '../utils/cryptoBox.js';
 import { orderLimiter } from '../middleware/rateLimits.js';
+import { detectRegion, priceForRegion, expectedPaymentMethod } from '../utils/region.js';
 
 export const publicRouter = express.Router();
 
@@ -20,15 +21,37 @@ const createOrderSchema = z.object({
     whatsapp: z.string().max(40).optional().default('')
   }),
   paymentMethod: z.enum(['bangladesh', 'pakistan', 'binance']),
+  priceRegion: z.enum(['bd', 'pk', 'world']).optional().default('world'),
   transactionId: z.string().min(4).max(120),
+  customerOrderRef: z.string().max(120).optional().default(''),
   paymentNote: z.string().max(500).optional().default('')
 });
+
+function publicProduct(p, availableStock, region = 'world') {
+  const displayPrice = priceForRegion(p, region);
+  return {
+    ...p,
+    pricing: {
+      bd: { amount: Number(p.priceBDT || 0), currency: 'BDT', originalAmount: Number(p.originalPriceBDT || 0) },
+      pk: { amount: Number(p.pricePKR || 0), currency: 'PKR', originalAmount: Number(p.originalPricePKR || 0) },
+      world: { amount: Number(p.priceUSDT || 0), currency: p.worldwideCurrency || 'USDT', originalAmount: Number(p.originalPriceUSDT || 0) }
+    },
+    displayPrice: { ...displayPrice, region },
+    availableStock: availableStock || 0
+  };
+}
 
 publicRouter.get('/health', (req, res) => {
   res.json({ ok: true, service: 'ai-digital-marketplace-api' });
 });
 
+publicRouter.get('/region', (req, res) => {
+  const { country, region } = detectRegion(req, req.query.region);
+  res.json({ country, region });
+});
+
 publicRouter.get('/products', asyncHandler(async (req, res) => {
+  const { region } = detectRegion(req, req.query.region);
   const products = await Product.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }).lean();
 
   const stockCounts = await StockItem.aggregate([
@@ -37,19 +60,15 @@ publicRouter.get('/products', asyncHandler(async (req, res) => {
   ]);
   const stockMap = new Map(stockCounts.map((item) => [item._id.toString(), item.count]));
 
-  res.json({
-    products: products.map((p) => ({
-      ...p,
-      availableStock: stockMap.get(p._id.toString()) || 0
-    }))
-  });
+  res.json({ products: products.map((p) => publicProduct(p, stockMap.get(p._id.toString()) || 0, region)), region });
 }));
 
 publicRouter.get('/products/:slug', asyncHandler(async (req, res) => {
+  const { region } = detectRegion(req, req.query.region);
   const product = await Product.findOne({ slug: req.params.slug, isActive: true }).lean();
   if (!product) return res.status(404).json({ error: 'Product not found' });
   const availableStock = await StockItem.countDocuments({ productId: product._id, status: 'available' });
-  res.json({ product: { ...product, availableStock } });
+  res.json({ product: publicProduct(product, availableStock, region), region });
 }));
 
 publicRouter.get('/payment-methods', asyncHandler(async (req, res) => {
@@ -67,26 +86,34 @@ publicRouter.post('/orders', orderLimiter, asyncHandler(async (req, res) => {
   const product = await Product.findOne({ _id: data.productId, isActive: true }).lean();
   if (!product) return res.status(404).json({ error: 'Product not found' });
 
+  const available = await StockItem.countDocuments({ productId: product._id, status: 'available' });
+  if (available <= 0) return res.status(409).json({ error: 'This product is out of stock' });
+
+  const { country, region } = detectRegion(req, data.priceRegion);
+  const expectedMethod = expectedPaymentMethod(region);
+  if (data.paymentMethod !== expectedMethod) {
+    return res.status(400).json({ error: `This region must use ${expectedMethod} payment.` });
+  }
+
   const method = await PaymentMethod.findOne({ key: data.paymentMethod, isActive: true }).lean();
   if (!method) return res.status(400).json({ error: 'Payment method is not active' });
 
-  let price = product.priceBDT;
-  let currency = 'BDT';
-  if (data.paymentMethod === 'pakistan') { price = product.pricePKR; currency = 'PKR'; }
-  if (data.paymentMethod === 'binance') { price = product.priceUSDT; currency = 'USDT'; }
-
+  const price = priceForRegion(product, region);
   const accessToken = createAccessToken();
   const order = await Order.create({
     orderId: createOrderId(),
     productId: product._id,
-    productSnapshot: { title: product.title, price, currency },
+    productSnapshot: { title: product.title, price: price.amount, currency: price.currency, priceRegion: region },
     customer: {
       name: data.customer.name.trim(),
       email: data.customer.email.toLowerCase().trim(),
       whatsapp: data.customer.whatsapp?.trim() || ''
     },
     paymentMethod: data.paymentMethod,
+    priceRegion: region,
+    detectedCountry: country,
     transactionId: data.transactionId.trim(),
+    customerOrderRef: data.customerOrderRef?.trim() || '',
     paymentNote: data.paymentNote,
     status: 'pending',
     accessTokenHash: sha256(accessToken),
@@ -100,10 +127,13 @@ publicRouter.post('/orders', orderLimiter, asyncHandler(async (req, res) => {
       orderId: order.orderId,
       status: order.status,
       productTitle: product.title,
-      amount: price,
-      currency
+      amount: price.amount,
+      currency: price.currency,
+      priceRegion: region,
+      paymentMethod: data.paymentMethod,
+      transactionId: order.transactionId,
+      customerOrderRef: order.customerOrderRef
     },
-    // Show/save this token in frontend localStorage. Do not expose delivery with orderId only.
     accessToken
   });
 }));
@@ -121,8 +151,16 @@ publicRouter.get('/orders/:orderId/status', asyncHandler(async (req, res) => {
       status: order.status,
       product: order.productSnapshot,
       paymentMethod: order.paymentMethod,
+      priceRegion: order.priceRegion,
+      detectedCountry: order.detectedCountry,
+      transactionId: order.transactionId,
+      customerOrderRef: order.customerOrderRef,
       createdAt: order.createdAt,
       reviewedAt: order.reviewedAt,
+      reviewedByNickname: order.reviewedByNickname || order.approvedByNickname || order.deliveredByNickname || order.rejectedByNickname || '',
+      approvedByNickname: order.approvedByNickname || '',
+      deliveredByNickname: order.deliveredByNickname || '',
+      rejectedByNickname: order.rejectedByNickname || '',
       rejectReason: order.rejectReason || null,
       deliveryAvailable: ['approved', 'delivered'].includes(order.status) && !!order.assignedStockItemId
     }
@@ -143,7 +181,6 @@ publicRouter.get('/orders/:orderId/delivery', asyncHandler(async (req, res) => {
   if (!stock) return res.status(404).json({ error: 'Delivery stock not found' });
 
   const payload = decryptJson(stock.encryptedPayload);
-  order.status = 'delivered';
   if (!order.deliveryViewedAt) order.deliveryViewedAt = new Date();
   await order.save();
 
