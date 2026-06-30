@@ -26,14 +26,6 @@ const adminCreateSchema = z.object({
 });
 const passwordSchema = z.object({ password: z.string().min(10) });
 
-
-const productReorderSchema = z.object({
-  items: z.array(z.object({
-    id: z.string().min(1),
-    sortOrder: z.number().int().min(1).max(100000)
-  })).min(1).max(1000)
-});
-
 const productSchema = z.object({
   title: z.string().min(2).max(120),
   slug: z.string().min(2).max(140).regex(/^[a-z0-9-]+$/),
@@ -223,43 +215,42 @@ adminRouter.patch('/users/:id/status', requireOwner, asyncHandler(async (req, re
 }));
 
 // Products
-adminRouter.get('/products', asyncHandler(async (req, res) => {
+
+adminRouter.patch('/products/reorder', asyncHandler(async (req, res) => {
+  const data = z.object({
+    products: z.array(z.object({
+      id: z.string().refine((value) => validator.isMongoId(value), { message: 'Invalid product ID' }),
+      sortOrder: z.number().int().min(1).max(100000)
+    })).min(1).max(500)
+  }).parse(req.body);
+
+  const session = await Product.startSession();
+  try {
+    await session.withTransaction(async () => {
+      for (const item of data.products) {
+        await Product.updateOne(
+          { _id: item.id },
+          {
+            $set: {
+              sortOrder: item.sortOrder,
+              updatedByAdminId: req.admin._id,
+              updatedByNickname: req.admin.nickname || req.admin.name
+            }
+          },
+          { session }
+        );
+      }
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  await logActivity(req.admin, 'product.reordered', 'product', req.admin._id, `${req.admin.nickname || req.admin.name} updated product display order`);
   const products = await Product.find().sort({ sortOrder: 1, createdAt: -1 }).lean();
   res.json({ products });
 }));
 
-
-adminRouter.patch('/products/reorder', asyncHandler(async (req, res) => {
-  const { items } = productReorderSchema.parse(req.body);
-
-  const validItems = items.filter((item) => validator.isMongoId(item.id));
-  if (validItems.length !== items.length) {
-    return res.status(400).json({ error: 'Invalid product ID in reorder list' });
-  }
-
-  const ops = validItems.map((item) => ({
-    updateOne: {
-      filter: { _id: item.id },
-      update: {
-        $set: {
-          sortOrder: item.sortOrder,
-          updatedByAdminId: req.admin._id,
-          updatedByNickname: req.admin.nickname || req.admin.name,
-        },
-      },
-    },
-  }));
-
-  if (ops.length) await Product.bulkWrite(ops, { ordered: false });
-
-  await logActivity(
-    req.admin,
-    'product.reordered',
-    'product',
-    'display-order',
-    `${req.admin.nickname || req.admin.name} updated product display order`
-  );
-
+adminRouter.get('/products', asyncHandler(async (req, res) => {
   const products = await Product.find().sort({ sortOrder: 1, createdAt: -1 }).lean();
   res.json({ products });
 }));
