@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 const orderSchema = new mongoose.Schema({
   orderId: { type: String, required: true, unique: true, index: true },
   productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true, index: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', default: null, index: true },
   productSnapshot: {
     title: String,
     price: Number,
