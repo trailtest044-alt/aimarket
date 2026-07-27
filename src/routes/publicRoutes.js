@@ -252,7 +252,7 @@ async function fetchLatestMailboxMessages(account) {
   const url = new URL('https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages');
   url.searchParams.set('$top', '10');
   url.searchParams.set('$orderby', 'receivedDateTime desc');
-  url.searchParams.set('$select', 'id,sender,subject,receivedDateTime,bodyPreview,body');
+  url.searchParams.set('$select', 'id,sender,toRecipients,ccRecipients,bccRecipients,subject,receivedDateTime,bodyPreview,body');
 
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` }
@@ -267,8 +267,40 @@ async function fetchLatestMailboxMessages(account) {
   return Array.isArray(json.value) ? json.value : [];
 }
 
+function normalizeMailTxtLookupEmail(email) {
+  const clean = String(email || '').toLowerCase().trim();
+  const atIndex = clean.indexOf('@');
+  if (atIndex <= 0) return clean;
+
+  const localPart = clean.slice(0, atIndex);
+  const domain = clean.slice(atIndex);
+  const plusIndex = localPart.indexOf('+');
+  const normalizedLocalPart = plusIndex >= 0 ? localPart.slice(0, plusIndex) : localPart;
+  return `${normalizedLocalPart}${domain}`;
+}
+
+function normalizeExactRecipientEmail(email) {
+  return String(email || '').toLowerCase().trim();
+}
+
+function messageWasSentToEmail(message, email) {
+  const targetEmail = normalizeExactRecipientEmail(email);
+  if (!targetEmail) return false;
+
+  const recipients = [
+    ...(Array.isArray(message?.toRecipients) ? message.toRecipients : []),
+    ...(Array.isArray(message?.ccRecipients) ? message.ccRecipients : []),
+    ...(Array.isArray(message?.bccRecipients) ? message.bccRecipients : [])
+  ];
+
+  return recipients.some((recipient) => {
+    const address = recipient?.emailAddress?.address || recipient?.address || '';
+    return normalizeExactRecipientEmail(address) === targetEmail;
+  });
+}
+
 async function findMailTxtAccount(email) {
-  const targetEmail = String(email || '').toLowerCase().trim();
+  const targetEmail = normalizeMailTxtLookupEmail(email);
   if (!targetEmail) return null;
 
   const files = await MailTxtFile.find().sort({ createdAt: -1 }).lean();
@@ -281,7 +313,7 @@ async function findMailTxtAccount(email) {
     }
 
     const account = Array.isArray(accounts)
-      ? accounts.find((item) => String(item.email || '').toLowerCase().trim() === targetEmail)
+      ? accounts.find((item) => normalizeMailTxtLookupEmail(item.email) === targetEmail)
       : null;
     if (account) return { ...account, fileName: file.name };
   }
@@ -341,6 +373,8 @@ publicRouter.post('/orders/:orderId/login-code', orderLimiter, asyncHandler(asyn
 
   const messages = await fetchLatestMailboxMessages(account);
   for (const message of messages) {
+    if (!messageWasSentToEmail(message, payload.email)) continue;
+
     const code = extractLoginCode(message);
     if (code) {
       return res.json({
@@ -352,7 +386,7 @@ publicRouter.post('/orders/:orderId/login-code', orderLimiter, asyncHandler(asyn
     }
   }
 
-  res.status(404).json({ error: 'No login code found in the latest inbox messages. Try refresh after a moment.' });
+  res.status(404).json({ error: 'No login code found for this exact delivered email. Send the code to the same email shown in your delivery, then refresh.' });
 }));
 
 publicRouter.get('/orders/:orderId/status', asyncHandler(async (req, res) => {
