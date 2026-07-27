@@ -8,6 +8,7 @@ import { PaymentMethod } from '../models/PaymentMethod.js';
 import { StockItem } from '../models/StockItem.js';
 import { Order } from '../models/Order.js';
 import { ActivityLog } from '../models/ActivityLog.js';
+import { MailTxtFile } from '../models/MailTxtFile.js';
 import { requireAdmin, requireOwner, signAdminToken } from '../middleware/auth.js';
 import { adminLoginLimiter } from '../middleware/rateLimits.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
@@ -44,6 +45,7 @@ const productSchema = z.object({
   originalPriceUSDT: z.number().min(0).optional().default(0),
   features: z.array(z.string().max(160)).optional().default([]),
   deliveryMethod: z.string().max(300).optional().default('Account login details will be delivered after admin approval.'),
+  deliveryMode: z.enum(['credentials', 'activation_code', 'login_code', 'manual']).optional().default('credentials'),
   terms: z.string().max(2000).optional().default(''),
   isActive: z.boolean().optional().default(true),
   sortOrder: z.number().optional().default(0)
@@ -63,16 +65,30 @@ const paymentMethodSchema = z.object({
 
 const stockSchema = z.object({
   productId: z.string().min(1),
-  type: z.enum(['credentials', 'instruction']),
+  type: z.enum(['credentials', 'activation_code', 'login_code', 'manual', 'instruction']),
   payload: z.object({
+    deliveryMode: z.enum(['credentials', 'activation_code', 'login_code', 'manual']).optional(),
     email: z.string().max(200).optional().default(''),
     password: z.string().max(500).optional().default(''),
+    activationCode: z.string().max(1000).optional().default(''),
     instruction: z.string().max(8000).optional().default(''),
     videoUrl: z.string().max(1000).optional().default(''),
     imageUrl: z.string().max(1000).optional().default(''),
     extra: z.record(z.any()).optional()
   }),
   adminNote: z.string().max(500).optional().default('')
+});
+
+const mailAccountSchema = z.object({
+  email: z.string().email().max(200),
+  password: z.string().max(500).optional().default(''),
+  refreshToken: z.string().min(10).max(5000),
+  clientId: z.string().min(10).max(500)
+});
+
+const mailTxtFileSchema = z.object({
+  name: z.string().min(1).max(160),
+  accounts: z.array(mailAccountSchema).min(1).max(5000)
 });
 
 function adminSafe(a) {
@@ -301,6 +317,66 @@ adminRouter.get('/stock', asyncHandler(async (req, res) => {
   res.json({ stock });
 }));
 
+// Mail TXT files used by login-code delivery. Accounts stay encrypted at rest.
+adminRouter.get('/mail-txt-files', asyncHandler(async (req, res) => {
+  const files = await MailTxtFile.find()
+    .sort({ createdAt: -1 })
+    .limit(200)
+    .select('-encryptedAccounts')
+    .lean();
+
+  res.json({
+    files: files.map((file) => ({
+      id: file._id?.toString(),
+      _id: file._id,
+      name: file.name,
+      accountCount: file.accountCount || 0,
+      uploadedByNickname: file.uploadedByNickname || '',
+      createdAt: file.createdAt,
+      updatedAt: file.updatedAt
+    }))
+  });
+}));
+
+adminRouter.post('/mail-txt-files', asyncHandler(async (req, res) => {
+  const data = mailTxtFileSchema.parse(req.body);
+  const accounts = data.accounts.map((account) => ({
+    email: account.email.toLowerCase().trim(),
+    password: account.password || '',
+    refreshToken: account.refreshToken.trim(),
+    clientId: account.clientId.trim()
+  }));
+
+  const file = await MailTxtFile.create({
+    name: data.name.trim(),
+    accountCount: accounts.length,
+    encryptedAccounts: encryptJson(accounts),
+    uploadedByAdminId: req.admin._id,
+    uploadedByNickname: req.admin.nickname || req.admin.name
+  });
+
+  await logActivity(req.admin, 'mail_txt.uploaded', 'mailTxtFile', file._id, `${req.admin.nickname || req.admin.name} uploaded ${accounts.length} mail accounts`);
+  res.status(201).json({
+    file: {
+      id: file._id?.toString(),
+      _id: file._id,
+      name: file.name,
+      accountCount: file.accountCount,
+      uploadedByNickname: file.uploadedByNickname,
+      createdAt: file.createdAt,
+      updatedAt: file.updatedAt
+    }
+  });
+}));
+
+adminRouter.delete('/mail-txt-files/:id', asyncHandler(async (req, res) => {
+  if (!validator.isMongoId(req.params.id)) return res.status(400).json({ error: 'Invalid TXT file ID' });
+  const file = await MailTxtFile.findByIdAndDelete(req.params.id);
+  if (!file) return res.status(404).json({ error: 'TXT file not found' });
+  await logActivity(req.admin, 'mail_txt.deleted', 'mailTxtFile', file._id, `${req.admin.nickname || req.admin.name} deleted mail TXT ${file.name}`);
+  res.json({ message: 'TXT file deleted' });
+}));
+
 adminRouter.post('/stock', asyncHandler(async (req, res) => {
   const data = stockSchema.parse(req.body);
   if (!validator.isMongoId(data.productId)) return res.status(400).json({ error: 'Invalid product ID' });
@@ -309,8 +385,11 @@ adminRouter.post('/stock', asyncHandler(async (req, res) => {
 
   const stock = await StockItem.create({
     productId: data.productId,
-    type: data.type,
-    encryptedPayload: encryptJson(data.payload),
+    type: data.type === 'instruction' ? 'manual' : data.type,
+    encryptedPayload: encryptJson({
+      ...data.payload,
+      deliveryMode: data.payload.deliveryMode || (data.type === 'instruction' ? 'manual' : data.type)
+    }),
     adminNote: data.adminNote || data.payload.instruction || '',
     createdByAdminId: req.admin._id,
     createdByNickname: req.admin.nickname || req.admin.name

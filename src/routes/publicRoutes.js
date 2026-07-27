@@ -5,6 +5,7 @@ import { Product } from '../models/Product.js';
 import { PaymentMethod } from '../models/PaymentMethod.js';
 import { Order } from '../models/Order.js';
 import { StockItem } from '../models/StockItem.js';
+import { MailTxtFile } from '../models/MailTxtFile.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { createAccessToken, createOrderId, sha256 } from '../utils/tokens.js';
 import { decryptJson } from '../utils/cryptoBox.js';
@@ -181,6 +182,112 @@ function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function stripHtml(value = '') {
+  return String(value)
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractLoginCode(message) {
+  const bodyContent = message?.body?.content ? stripHtml(message.body.content) : '';
+  const text = [
+    message?.subject || '',
+    message?.bodyPreview || '',
+    bodyContent
+  ].join(' ');
+
+  const patterns = [
+    /\b(?:verification|security|login|sign[-\s]?in|one[-\s]?time|otp|code)\D{0,60}([0-9]{4,8})\b/i,
+    /\b([0-9]{4,8})\D{0,60}(?:verification|security|login|sign[-\s]?in|one[-\s]?time|otp|code)\b/i,
+    /\b(?:verification|security|login|sign[-\s]?in|one[-\s]?time|otp|code)\D{0,60}((?=[A-Z0-9]{6,10}\b)(?=[A-Z0-9]*[0-9])[A-Z0-9]+)\b/i,
+    /\b((?=[A-Z0-9]{6,10}\b)(?=[A-Z0-9]*[0-9])[A-Z0-9]+)\b/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return match[1].trim();
+  }
+  return '';
+}
+
+async function requestMicrosoftAccessToken(account) {
+  const body = new URLSearchParams({
+    client_id: account.clientId,
+    refresh_token: account.refreshToken,
+    grant_type: 'refresh_token',
+    redirect_uri: 'https://login.live.com/oauth20_desktop.srf'
+  });
+
+  const endpoints = [
+    'https://login.live.com/oauth20_token.srf',
+    'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
+    'https://login.microsoftonline.com/common/oauth2/v2.0/token'
+  ];
+
+  let lastError = 'Microsoft token refresh failed';
+  for (const endpoint of endpoints) {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+    const json = await response.json().catch(() => ({}));
+    if (response.ok && json.access_token) return json.access_token;
+    lastError = json.error_description || json.error || lastError;
+  }
+
+  const err = new Error(lastError);
+  err.status = 502;
+  err.publicMessage = 'Could not connect to this mailbox. Check the TXT refresh token/client id.';
+  throw err;
+}
+
+async function fetchLatestMailboxMessages(account) {
+  const accessToken = await requestMicrosoftAccessToken(account);
+  const url = new URL('https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages');
+  url.searchParams.set('$top', '10');
+  url.searchParams.set('$orderby', 'receivedDateTime desc');
+  url.searchParams.set('$select', 'id,sender,subject,receivedDateTime,bodyPreview,body');
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const err = new Error(json.error?.message || 'Microsoft inbox read failed');
+    err.status = 502;
+    err.publicMessage = 'Could not read the mailbox inbox right now.';
+    throw err;
+  }
+  return Array.isArray(json.value) ? json.value : [];
+}
+
+async function findMailTxtAccount(email) {
+  const targetEmail = String(email || '').toLowerCase().trim();
+  if (!targetEmail) return null;
+
+  const files = await MailTxtFile.find().sort({ createdAt: -1 }).lean();
+  for (const file of files) {
+    let accounts = [];
+    try {
+      accounts = decryptJson(file.encryptedAccounts);
+    } catch {
+      accounts = [];
+    }
+
+    const account = Array.isArray(accounts)
+      ? accounts.find((item) => String(item.email || '').toLowerCase().trim() === targetEmail)
+      : null;
+    if (account) return { ...account, fileName: file.name };
+  }
+  return null;
+}
+
 publicRouter.post('/track-orders', asyncHandler(async (req, res) => {
   const { code } = z.object({ code: z.string().min(3).max(160) }).parse(req.body);
   const clean = code.trim();
@@ -206,6 +313,46 @@ publicRouter.post('/track-orders', asyncHandler(async (req, res) => {
   }
 
   res.json({ orders: results });
+}));
+
+publicRouter.post('/orders/:orderId/login-code', orderLimiter, asyncHandler(async (req, res) => {
+  const token = req.query.token;
+  if (!token || typeof token !== 'string') return res.status(401).json({ error: 'Order access token required' });
+
+  const order = await Order.findOne({ orderId: req.params.orderId, accessTokenHash: sha256(token) });
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (!['approved', 'delivered'].includes(order.status) || !order.assignedStockItemId) {
+    return res.status(403).json({ error: 'Delivery is not available yet' });
+  }
+
+  const stock = await StockItem.findById(order.assignedStockItemId).lean();
+  if (!stock) return res.status(404).json({ error: 'Delivery stock not found' });
+
+  const payload = decryptJson(stock.encryptedPayload);
+  const deliveryMode = payload.deliveryMode || stock.type;
+  if (deliveryMode !== 'login_code') {
+    return res.status(400).json({ error: 'This delivery does not use login-code automation' });
+  }
+
+  const account = await findMailTxtAccount(payload.email);
+  if (!account) {
+    return res.status(404).json({ error: 'Delivered email was not found in uploaded Mail TXT files' });
+  }
+
+  const messages = await fetchLatestMailboxMessages(account);
+  for (const message of messages) {
+    const code = extractLoginCode(message);
+    if (code) {
+      return res.json({
+        code,
+        subject: message.subject || '',
+        receivedAt: message.receivedDateTime || null,
+        preview: message.bodyPreview || ''
+      });
+    }
+  }
+
+  res.status(404).json({ error: 'No login code found in the latest inbox messages. Try refresh after a moment.' });
 }));
 
 publicRouter.get('/orders/:orderId/status', asyncHandler(async (req, res) => {

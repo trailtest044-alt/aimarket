@@ -18,6 +18,11 @@ const productSchema = new mongoose.Schema({
   originalPriceUSDT: { type: Number, default: 0, min: 0 },
   features: [{ type: String }],
   deliveryMethod: { type: String, default: 'Account login details will be delivered after admin approval.' },
+  deliveryMode: {
+    type: String,
+    enum: ['credentials', 'activation_code', 'login_code', 'manual'],
+    default: 'credentials'
+  },
   terms: { type: String, default: '' },
   isActive: { type: Boolean, default: true, index: true },
   sortOrder: { type: Number, default: 0 },

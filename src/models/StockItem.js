@@ -10,7 +10,11 @@ const encryptedBoxSchema = new mongoose.Schema({
 
 const stockItemSchema = new mongoose.Schema({
   productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true, index: true },
-  type: { type: String, enum: ['credentials', 'instruction'], required: true },
+  type: {
+    type: String,
+    enum: ['credentials', 'activation_code', 'login_code', 'manual', 'instruction'],
+    required: true
+  },
   encryptedPayload: { type: encryptedBoxSchema, required: true },
   status: { type: String, enum: ['available', 'reserved', 'delivered', 'disabled'], default: 'available', index: true },
   assignedOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
