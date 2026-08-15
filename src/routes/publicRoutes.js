@@ -7,6 +7,8 @@ import { Order } from '../models/Order.js';
 import { StockItem } from '../models/StockItem.js';
 import { MailTxtFile } from '../models/MailTxtFile.js';
 import { Customer } from '../models/Customer.js';
+import { Visitor } from '../models/Visitor.js';
+import { PromoCode } from '../models/PromoCode.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { createAccessToken, createOrderId, sha256 } from '../utils/tokens.js';
 import { decryptJson } from '../utils/cryptoBox.js';
@@ -17,6 +19,13 @@ import { env } from '../config/env.js';
 import jwt from 'jsonwebtoken';
 
 export const publicRouter = express.Router();
+
+const visitorSchema = z.object({
+  visitorId: z.string().min(16).max(128),
+  sessionId: z.string().min(16).max(128),
+  path: z.string().min(1).max(220).default('/'),
+  referrer: z.string().max(1000).optional().default('')
+});
 
 const createOrderSchema = z.object({
   productId: z.string().min(1),
@@ -29,7 +38,8 @@ const createOrderSchema = z.object({
   priceRegion: z.enum(['bd', 'pk', 'world']).optional().default('world'),
   transactionId: z.string().min(4).max(120),
   customerOrderRef: z.string().max(120).optional().default(''),
-  paymentNote: z.string().max(500).optional().default('')
+  paymentNote: z.string().max(500).optional().default(''),
+  promoCode: z.string().max(40).optional().default('')
 });
 
 function customerSafe(customer) {
@@ -154,9 +164,91 @@ function publicProduct(p, availableStock, region = 'world') {
   };
 }
 
+function promoAmountFields(region) {
+  if (region === 'bd') return { fixed: 'fixedBDT', min: 'minAmountBDT' };
+  if (region === 'pk') return { fixed: 'fixedPKR', min: 'minAmountPKR' };
+  return { fixed: 'fixedUSDT', min: 'minAmountUSDT' };
+}
+
+function normalizePromoCode(code) {
+  return String(code || '').toUpperCase().trim();
+}
+
+function promoAvailabilityError(promo, productId, region, amount) {
+  const now = new Date();
+  if (!promo) return 'This promo code is not valid.';
+  if (!promo.isActive) return 'This promo code is not active.';
+  if (promo.startsAt && new Date(promo.startsAt) > now) return 'This promo code has not started yet.';
+  if (promo.expiresAt && new Date(promo.expiresAt) < now) return 'This promo code has expired.';
+  if (promo.maxUses > 0 && promo.usedCount >= promo.maxUses) return 'This promo code has reached its usage limit.';
+  if (Array.isArray(promo.productIds) && promo.productIds.length && !promo.productIds.some((id) => String(id) === String(productId))) return 'This promo code is not valid for this product.';
+
+  const { min } = promoAmountFields(region);
+  if (Number(promo[min] || 0) > 0 && amount < Number(promo[min] || 0)) return 'Order amount is too low for this promo code.';
+  return '';
+}
+
+function calculatePromoDiscount(promo, region, amount) {
+  if (!promo) return 0;
+  if (promo.discountType === 'percent') {
+    return Math.min(amount, Math.round((amount * Number(promo.percentOff || 0)) / 100 * 100) / 100);
+  }
+  const { fixed } = promoAmountFields(region);
+  return Math.min(amount, Number(promo[fixed] || 0));
+}
+
+async function applyPromoToPrice(code, productId, region, amount) {
+  const normalized = normalizePromoCode(code);
+  if (!normalized) return { discount: 0, promo: null };
+
+  const promo = await PromoCode.findOne({ code: normalized });
+  const error = promoAvailabilityError(promo, productId, region, amount);
+  if (error) {
+    const err = new Error(error);
+    err.status = 400;
+    err.publicMessage = error;
+    throw err;
+  }
+
+  const discount = calculatePromoDiscount(promo, region, amount);
+  return { discount, promo };
+}
+
 publicRouter.get('/health', (req, res) => {
   res.json({ ok: true, service: 'ai-digital-marketplace-api' });
 });
+
+// Anonymous traffic measurement. This intentionally stores no name, email, IP address, or full referrer URL.
+publicRouter.post('/analytics/visit', asyncHandler(async (req, res) => {
+  const data = visitorSchema.parse(req.body);
+  const now = new Date();
+  let referrerHost = '';
+  try { referrerHost = data.referrer ? new URL(data.referrer).hostname.slice(0, 180) : ''; } catch { /* ignore malformed referrer */ }
+
+  const visitor = await Visitor.findOne({ visitorId: data.visitorId });
+  if (!visitor) {
+    await Visitor.create({
+      visitorId: data.visitorId,
+      lastSessionId: data.sessionId,
+      visitCount: 1,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      lastPath: data.path,
+      referrerHost
+    });
+  } else {
+    if (visitor.lastSessionId !== data.sessionId) {
+      visitor.visitCount += 1;
+      visitor.lastSessionId = data.sessionId;
+    }
+    visitor.lastSeenAt = now;
+    visitor.lastPath = data.path;
+    visitor.referrerHost = referrerHost;
+    await visitor.save();
+  }
+
+  res.status(204).end();
+}));
 
 publicRouter.get('/auth/google/start', asyncHandler(async (req, res) => {
   requireGoogleConfig();
@@ -226,6 +318,31 @@ publicRouter.get('/payment-methods', asyncHandler(async (req, res) => {
   res.json({ methods });
 }));
 
+publicRouter.post('/promo/validate', asyncHandler(async (req, res) => {
+  const data = z.object({
+    code: z.string().min(1).max(40),
+    productId: z.string().refine((value) => validator.isMongoId(value), { message: 'Invalid product ID' }),
+    priceRegion: z.enum(['bd', 'pk', 'world'])
+  }).parse(req.body);
+
+  const product = await Product.findOne({ _id: data.productId, isActive: true }).lean();
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const price = priceForRegion(product, data.priceRegion);
+  const { discount, promo } = await applyPromoToPrice(data.code, product._id, data.priceRegion, Number(price.amount || 0));
+
+  res.json({
+    valid: true,
+    code: promo.code,
+    description: promo.description || '',
+    discountType: promo.discountType,
+    percentOff: promo.percentOff || 0,
+    discount,
+    originalAmount: Number(price.amount || 0),
+    finalAmount: Math.max(0, Math.round((Number(price.amount || 0) - discount) * 100) / 100)
+  });
+}));
+
 publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (req, res) => {
   const data = createOrderSchema.parse(req.body);
 
@@ -259,12 +376,14 @@ publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (
   if (!method) return res.status(400).json({ error: 'Payment method is not active' });
 
   const price = priceForRegion(product, finalPriceRegion);
+  const promoResult = await applyPromoToPrice(data.promoCode, product._id, finalPriceRegion, Number(price.amount || 0));
+  const finalAmount = Math.max(0, Math.round((Number(price.amount || 0) - promoResult.discount) * 100) / 100);
   const accessToken = createAccessToken();
   const order = await Order.create({
     orderId: createOrderId(),
     productId: product._id,
     customerId: req.customer?._id || null,
-    productSnapshot: { title: product.title, price: price.amount, currency: price.currency, priceRegion: finalPriceRegion },
+    productSnapshot: { title: product.title, price: finalAmount, currency: price.currency, priceRegion: finalPriceRegion },
     customer: {
       name: data.customer.name.trim() || req.customer.name || '',
       email: req.customer.email,
@@ -282,13 +401,17 @@ publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (
     userAgent: req.headers['user-agent'] || ''
   });
 
+  if (promoResult.promo) {
+    await PromoCode.updateOne({ _id: promoResult.promo._id }, { $inc: { usedCount: 1 } });
+  }
+
   res.status(201).json({
     message: 'Order submitted. Waiting for admin approval.',
     order: {
       orderId: order.orderId,
       status: order.status,
       productTitle: product.title,
-      amount: price.amount,
+      amount: finalAmount,
       currency: price.currency,
       priceRegion: finalPriceRegion,
       paymentMethod: data.paymentMethod,

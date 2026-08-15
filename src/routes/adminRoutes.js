@@ -9,6 +9,9 @@ import { StockItem } from '../models/StockItem.js';
 import { Order } from '../models/Order.js';
 import { ActivityLog } from '../models/ActivityLog.js';
 import { MailTxtFile } from '../models/MailTxtFile.js';
+import { PromoCode } from '../models/PromoCode.js';
+import { Customer } from '../models/Customer.js';
+import { Visitor } from '../models/Visitor.js';
 import { requireAdmin, requireOwner, signAdminToken } from '../middleware/auth.js';
 import { adminLoginLimiter } from '../middleware/rateLimits.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
@@ -91,6 +94,33 @@ const mailTxtFileSchema = z.object({
   accounts: z.array(mailAccountSchema).min(1).max(5000)
 });
 
+const promoSchema = z.object({
+  code: z.string().min(2).max(40).regex(/^[A-Za-z0-9_-]+$/),
+  description: z.string().max(300).optional().default(''),
+  discountType: z.enum(['percent', 'fixed']),
+  percentOff: z.number().min(0).max(100).optional().default(0),
+  fixedBDT: z.number().min(0).optional().default(0),
+  fixedPKR: z.number().min(0).optional().default(0),
+  fixedUSDT: z.number().min(0).optional().default(0),
+  maxUses: z.number().min(0).optional().default(0),
+  minAmountBDT: z.number().min(0).optional().default(0),
+  minAmountPKR: z.number().min(0).optional().default(0),
+  minAmountUSDT: z.number().min(0).optional().default(0),
+  productIds: z.array(z.string().refine((value) => validator.isMongoId(value), { message: 'Invalid product ID' })).optional().default([]),
+  startsAt: z.string().nullable().optional().default(null),
+  expiresAt: z.string().nullable().optional().default(null),
+  isActive: z.boolean().optional().default(true)
+});
+
+function promoPayload(data) {
+  return {
+    ...data,
+    code: data.code.toUpperCase().trim(),
+    startsAt: data.startsAt ? new Date(data.startsAt) : null,
+    expiresAt: data.expiresAt ? new Date(data.expiresAt) : null
+  };
+}
+
 function adminSafe(a) {
   return {
     id: a._id?.toString?.() || a.id,
@@ -131,7 +161,9 @@ adminRouter.use(requireAdmin);
 adminRouter.get('/me', (req, res) => res.json({ admin: req.admin }));
 
 adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
-  const [totalProducts, pendingOrders, approvedOrders, deliveredOrders, rejectedOrders, availableStock, lowStockAgg, productSales, recentOrders, recentActivity] = await Promise.all([
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const [totalProducts, pendingOrders, approvedOrders, deliveredOrders, rejectedOrders, availableStock, lowStockAgg, productSales, recentOrders, recentActivity, signedUpUsers, uniqueVisitors, visitTotals, visitsToday] = await Promise.all([
     Product.countDocuments({ isActive: true }),
     Order.countDocuments({ status: 'pending' }),
     Order.countDocuments({ status: 'approved' }),
@@ -157,7 +189,11 @@ adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
       { $limit: 20 }
     ]),
     Order.find().populate('productId', 'title slug').sort({ createdAt: -1 }).limit(8).lean(),
-    ActivityLog.find().sort({ createdAt: -1 }).limit(12).lean()
+    ActivityLog.find().sort({ createdAt: -1 }).limit(12).lean(),
+    Customer.countDocuments(),
+    Visitor.countDocuments(),
+    Visitor.aggregate([{ $group: { _id: null, total: { $sum: '$visitCount' } } }]),
+    Visitor.countDocuments({ lastSeenAt: { $gte: todayStart } })
   ]);
 
   const products = await Product.find({ _id: { $in: productSales.map(x => x._id).concat(lowStockAgg.map(x => x._id)) } }).lean();
@@ -174,11 +210,159 @@ adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
   }));
 
   res.json({
-    stats: { totalProducts, pendingOrders, approvedOrders, deliveredOrders, rejectedOrders, soldOrders: approvedOrders + deliveredOrders, availableStock },
+    stats: {
+      totalProducts,
+      totalCustomers: signedUpUsers,
+      signedUpUsers,
+      uniqueVisitors,
+      totalVisits: visitTotals[0]?.total || 0,
+      visitsToday,
+      pendingOrders,
+      approvedOrders,
+      deliveredOrders,
+      rejectedOrders,
+      soldOrders: approvedOrders + deliveredOrders,
+      availableStock
+    },
     salesByProduct,
     lowStock: lowStockAgg.map(x => ({ productId: x._id?.toString(), productName: productMap.get(x._id?.toString())?.title || 'Unknown product', available: x.available })),
     recentOrders,
     recentActivity
+  });
+}));
+
+function customerOrderSafe(order) {
+  return {
+    id: order.orderId,
+    productName: order.productSnapshot?.title || order.productId?.title || 'Product',
+    amount: order.productSnapshot?.price || 0,
+    currency: order.productSnapshot?.currency || 'USDT',
+    status: order.status,
+    paymentMethod: order.paymentMethod,
+    transactionId: order.transactionId || '',
+    customerOrderRef: order.customerOrderRef || '',
+    createdAt: order.createdAt,
+    reviewedAt: order.reviewedAt || null,
+    approvedAt: order.approvedAt || null,
+    deliveredAt: order.deliveredAt || null,
+    rejectedAt: order.rejectedAt || null,
+    approvedByNickname: order.approvedByNickname || '',
+    deliveredByNickname: order.deliveredByNickname || '',
+    rejectedByNickname: order.rejectedByNickname || '',
+    rejectReason: order.rejectReason || ''
+  };
+}
+
+function customerSummary(customer, orders) {
+  const email = customer?.email || orders[0]?.customer?.email || '';
+  const name = customer?.name || orders[0]?.customer?.name || email;
+  return {
+    id: customer?._id?.toString() || '',
+    key: customer?._id?.toString() || email,
+    name,
+    email,
+    whatsapp: orders.find((order) => order.customer?.whatsapp)?.customer?.whatsapp || '',
+    picture: customer?.picture || '',
+    orderCount: orders.length,
+    lastOrderAt: orders[0]?.createdAt || null,
+    joinedAt: customer?.createdAt || null,
+    lastLoginAt: customer?.lastLoginAt || null
+  };
+}
+
+adminRouter.get('/customers/search', asyncHandler(async (req, res) => {
+  const query = String(req.query.q || '').trim();
+  if (query.length < 2) return res.json({ customers: [] });
+  const re = searchRegex(query);
+  const [customers, orderMatches] = await Promise.all([
+    Customer.find({ $or: [{ name: re }, { email: re }] }).sort({ lastLoginAt: -1, createdAt: -1 }).limit(20).lean(),
+    Order.find({ $or: [{ 'customer.name': re }, { 'customer.email': re }, { 'customer.whatsapp': re }, { orderId: re }, { transactionId: re }, { customerOrderRef: re }] }).sort({ createdAt: -1 }).limit(80).lean()
+  ]);
+
+  const ordersByEmail = new Map();
+  for (const order of orderMatches) {
+    const email = String(order.customer?.email || '').toLowerCase();
+    if (!email) continue;
+    if (!ordersByEmail.has(email)) ordersByEmail.set(email, []);
+    ordersByEmail.get(email).push(order);
+  }
+  const result = new Map();
+  for (const customer of customers) {
+    const email = String(customer.email || '').toLowerCase();
+    result.set(email, customerSummary(customer, ordersByEmail.get(email) || []));
+  }
+  for (const [email, orders] of ordersByEmail) {
+    if (!result.has(email)) result.set(email, customerSummary(null, orders));
+  }
+
+  res.json({ customers: Array.from(result.values()).sort((a, b) => String(b.lastOrderAt || b.lastLoginAt || b.joinedAt || '').localeCompare(String(a.lastOrderAt || a.lastLoginAt || a.joinedAt || ''))).slice(0, 20) });
+}));
+
+adminRouter.get('/customers/:key', asyncHandler(async (req, res) => {
+  const key = decodeURIComponent(String(req.params.key || '')).trim();
+  let customer = null;
+  if (validator.isMongoId(key)) customer = await Customer.findById(key).lean();
+  if (!customer && validator.isEmail(key)) customer = await Customer.findOne({ email: key.toLowerCase() }).lean();
+  const email = String(customer?.email || (validator.isEmail(key) ? key.toLowerCase() : '')).toLowerCase();
+  if (!email) return res.status(404).json({ error: 'Customer not found' });
+
+  const orderOwnerFilters = [{ 'customer.email': email }];
+  if (customer?._id) orderOwnerFilters.unshift({ customerId: customer._id });
+  const orders = await Order.find({ $or: orderOwnerFilters })
+    .populate('productId', 'title slug')
+    .sort({ createdAt: -1 })
+    .limit(200)
+    .lean();
+  if (!customer && !orders.length) return res.status(404).json({ error: 'Customer not found' });
+
+  const summary = customerSummary(customer, orders);
+  const history = [];
+  if (customer?.createdAt) history.push({ type: 'signup', at: customer.createdAt, title: 'Customer account created', detail: 'Google sign-in account created.' });
+  if (customer?.lastLoginAt) history.push({ type: 'login', at: customer.lastLoginAt, title: 'Last sign-in', detail: 'Customer last signed in with Google.' });
+  for (const order of orders) {
+    history.push({ type: 'order', at: order.createdAt, title: `Order ${order.orderId} submitted`, detail: order.productSnapshot?.title || 'Product order' });
+    if (order.approvedAt) history.push({ type: 'approved', at: order.approvedAt, title: `Order ${order.orderId} approved`, detail: order.approvedByNickname ? `Approved by ${order.approvedByNickname}` : '' });
+    if (order.deliveredAt) history.push({ type: 'delivered', at: order.deliveredAt, title: `Order ${order.orderId} delivered`, detail: order.deliveredByNickname ? `Delivered by ${order.deliveredByNickname}` : '' });
+    if (order.rejectedAt) history.push({ type: 'rejected', at: order.rejectedAt, title: `Order ${order.orderId} rejected`, detail: order.rejectReason || '' });
+  }
+  history.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+  res.json({
+    customer: summary,
+    orders: orders.map(customerOrderSafe),
+    summary: {
+      totalOrders: orders.length,
+      pendingOrders: orders.filter((order) => order.status === 'pending').length,
+      approvedOrders: orders.filter((order) => order.status === 'approved').length,
+      deliveredOrders: orders.filter((order) => order.status === 'delivered').length,
+      rejectedOrders: orders.filter((order) => order.status === 'rejected').length
+    },
+    history: history.slice(0, 250)
+  });
+}));
+
+// Sensitive delivery data is revealed only for one selected order. Every support reveal is logged.
+adminRouter.get('/customers/orders/:orderId/delivery', asyncHandler(async (req, res) => {
+  const order = await Order.findOne({ orderId: req.params.orderId }).lean();
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (!order.assignedStockItemId) return res.status(404).json({ error: 'No delivery details are assigned to this order yet' });
+
+  const stock = await StockItem.findById(order.assignedStockItemId).lean();
+  if (!stock) return res.status(404).json({ error: 'Delivery item not found' });
+  const payload = decryptJson(stock.encryptedPayload);
+  await logActivity(req.admin, 'customer.delivery_revealed', 'order', order.orderId, `${req.admin.nickname || req.admin.name} viewed delivery details for ${order.orderId}`, { customerEmail: order.customer?.email || '' });
+
+  res.json({
+    delivery: {
+      orderId: order.orderId,
+      deliveryMode: payload.deliveryMode || stock.type,
+      email: payload.email || '',
+      password: payload.password || '',
+      activationCode: payload.activationCode || '',
+      instruction: payload.instruction || '',
+      videoUrl: payload.videoUrl || '',
+      imageUrl: payload.imageUrl || ''
+    }
   });
 }));
 
@@ -306,6 +490,55 @@ adminRouter.put('/payment-methods/:key', asyncHandler(async (req, res) => {
   const method = await PaymentMethod.findOneAndUpdate({ key: data.key }, data, { upsert: true, new: true, runValidators: true });
   await logActivity(req.admin, 'payment.updated', 'paymentMethod', data.key, `${req.admin.nickname || req.admin.name} updated ${data.title} payment settings`);
   res.json({ method });
+}));
+
+// Promo codes
+adminRouter.get('/promo-codes', asyncHandler(async (req, res) => {
+  const promos = await PromoCode.find().sort({ createdAt: -1 }).lean();
+  res.json({ promos });
+}));
+
+adminRouter.post('/promo-codes', asyncHandler(async (req, res) => {
+  const data = promoPayload(promoSchema.parse(req.body));
+  const promo = await PromoCode.create({
+    ...data,
+    createdByAdminId: req.admin._id,
+    createdByNickname: req.admin.nickname || req.admin.name
+  });
+  await logActivity(req.admin, 'promo.created', 'promoCode', promo._id, `${req.admin.nickname || req.admin.name} created promo ${promo.code}`);
+  res.status(201).json({ promo });
+}));
+
+adminRouter.put('/promo-codes/:id', asyncHandler(async (req, res) => {
+  if (!validator.isMongoId(req.params.id)) return res.status(400).json({ error: 'Invalid promo ID' });
+  const data = promoPayload(promoSchema.parse(req.body));
+  const promo = await PromoCode.findByIdAndUpdate(
+    req.params.id,
+    { ...data, updatedByAdminId: req.admin._id, updatedByNickname: req.admin.nickname || req.admin.name },
+    { new: true, runValidators: true }
+  );
+  if (!promo) return res.status(404).json({ error: 'Promo code not found' });
+  await logActivity(req.admin, 'promo.updated', 'promoCode', promo._id, `${req.admin.nickname || req.admin.name} updated promo ${promo.code}`);
+  res.json({ promo });
+}));
+
+adminRouter.patch('/promo-codes/:id/status', asyncHandler(async (req, res) => {
+  if (!validator.isMongoId(req.params.id)) return res.status(400).json({ error: 'Invalid promo ID' });
+  const promo = await PromoCode.findByIdAndUpdate(
+    req.params.id,
+    { isActive: !!req.body.isActive, updatedByAdminId: req.admin._id, updatedByNickname: req.admin.nickname || req.admin.name },
+    { new: true, runValidators: true }
+  );
+  if (!promo) return res.status(404).json({ error: 'Promo code not found' });
+  res.json({ promo });
+}));
+
+adminRouter.delete('/promo-codes/:id', asyncHandler(async (req, res) => {
+  if (!validator.isMongoId(req.params.id)) return res.status(400).json({ error: 'Invalid promo ID' });
+  const promo = await PromoCode.findByIdAndDelete(req.params.id);
+  if (!promo) return res.status(404).json({ error: 'Promo code not found' });
+  await logActivity(req.admin, 'promo.deleted', 'promoCode', promo._id, `${req.admin.nickname || req.admin.name} deleted promo ${promo.code}`);
+  res.json({ message: 'Promo code deleted' });
 }));
 
 // Stock
