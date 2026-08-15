@@ -42,13 +42,32 @@ const productSchema = z.object({
   priceBDT: z.number().min(0),
   pricePKR: z.number().min(0),
   priceUSDT: z.number().min(0),
+  isFree: z.boolean().optional().default(false),
   worldwideCurrency: z.enum(['USDT', 'USD']).optional().default('USDT'),
   originalPriceBDT: z.number().min(0).optional().default(0),
   originalPricePKR: z.number().min(0).optional().default(0),
   originalPriceUSDT: z.number().min(0).optional().default(0),
+  purchaseCostBDT: z.number().min(0).optional().default(0),
+  purchaseCostPKR: z.number().min(0).optional().default(0),
+  purchaseCostUSDT: z.number().min(0).optional().default(0),
+  accountCostBDT: z.number().min(0).optional().default(0),
+  accountCostPKR: z.number().min(0).optional().default(0),
+  accountCostUSDT: z.number().min(0).optional().default(0),
+  paymentGatewayFeeBDT: z.number().min(0).optional().default(0),
+  paymentGatewayFeePKR: z.number().min(0).optional().default(0),
+  paymentGatewayFeeUSDT: z.number().min(0).optional().default(0),
+  otherExpenseBDT: z.number().min(0).optional().default(0),
+  otherExpensePKR: z.number().min(0).optional().default(0),
+  otherExpenseUSDT: z.number().min(0).optional().default(0),
   features: z.array(z.string().max(160)).optional().default([]),
   deliveryMethod: z.string().max(300).optional().default('Account login details will be delivered after admin approval.'),
   deliveryMode: z.enum(['credentials', 'activation_code', 'login_code', 'manual']).optional().default('credentials'),
+  deliveryInstruction: z.string().max(8000).optional().default(''),
+  deliveryVideoUrl: z.string().max(1000).optional().default(''),
+  deliveryImageUrl: z.string().max(1000).optional().default(''),
+  passwordInstructionVideoUrl: z.string().max(1000).optional().default(''),
+  manualInputMode: z.enum(['ideogram_credentials', 'email_password', 'email_only']).optional().default('ideogram_credentials'),
+  backorderStock: z.number().int().min(0).optional().default(0),
   terms: z.string().max(2000).optional().default(''),
   isActive: z.boolean().optional().default(true),
   sortOrder: z.number().optional().default(0)
@@ -181,6 +200,9 @@ adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
       { $group: {
         _id: '$productId',
         sold: { $sum: 1 },
+        soldBDT: { $sum: { $cond: [{ $eq: ['$productSnapshot.currency', 'BDT'] }, 1, 0] } },
+        soldPKR: { $sum: { $cond: [{ $eq: ['$productSnapshot.currency', 'PKR'] }, 1, 0] } },
+        soldWorld: { $sum: { $cond: [{ $in: ['$productSnapshot.currency', ['USDT', 'USD']] }, 1, 0] } },
         revenueBDT: { $sum: { $cond: [{ $eq: ['$productSnapshot.currency', 'BDT'] }, '$productSnapshot.price', 0] } },
         revenuePKR: { $sum: { $cond: [{ $eq: ['$productSnapshot.currency', 'PKR'] }, '$productSnapshot.price', 0] } },
         revenueWorld: { $sum: { $cond: [{ $in: ['$productSnapshot.currency', ['USDT', 'USD']] }, '$productSnapshot.price', 0] } }
@@ -203,11 +225,41 @@ adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
     productId: item._id?.toString(),
     productName: productMap.get(item._id?.toString())?.title || 'Unknown product',
     sold: item.sold,
+    soldBDT: item.soldBDT,
+    soldPKR: item.soldPKR,
+    soldWorld: item.soldWorld,
     revenueBDT: item.revenueBDT,
     revenuePKR: item.revenuePKR,
     revenueWorld: item.revenueWorld,
     availableStock: lowStockAgg.find(x => String(x._id) === String(item._id))?.available ?? null
   }));
+
+  const moneyBag = (BDT = 0, PKR = 0, USDT = 0) => ({ BDT, PKR, USDT, USD: 0 });
+  const revenue = moneyBag(
+    productSales.reduce((sum, item) => sum + Number(item.revenueBDT || 0), 0),
+    productSales.reduce((sum, item) => sum + Number(item.revenuePKR || 0), 0),
+    productSales.reduce((sum, item) => sum + Number(item.revenueWorld || 0), 0)
+  );
+  const soldByCurrency = moneyBag(
+    productSales.reduce((sum, item) => sum + Number(item.soldBDT || 0), 0),
+    productSales.reduce((sum, item) => sum + Number(item.soldPKR || 0), 0),
+    productSales.reduce((sum, item) => sum + Number(item.soldWorld || 0), 0)
+  );
+  const profit = productSales.reduce((totals, item) => {
+    const product = productMap.get(item._id?.toString()) || {};
+    const unitCostBDT = Number(product.purchaseCostBDT || 0) + Number(product.accountCostBDT || 0) + Number(product.paymentGatewayFeeBDT || 0) + Number(product.otherExpenseBDT || 0);
+    const unitCostPKR = Number(product.purchaseCostPKR || 0) + Number(product.accountCostPKR || 0) + Number(product.paymentGatewayFeePKR || 0) + Number(product.otherExpensePKR || 0);
+    const unitCostUSDT = Number(product.purchaseCostUSDT || 0) + Number(product.accountCostUSDT || 0) + Number(product.paymentGatewayFeeUSDT || 0) + Number(product.otherExpenseUSDT || 0);
+    totals.BDT += Number(item.revenueBDT || 0) - Number(item.soldBDT || 0) * unitCostBDT;
+    totals.PKR += Number(item.revenuePKR || 0) - Number(item.soldPKR || 0) * unitCostPKR;
+    totals.USDT += Number(item.revenueWorld || 0) - Number(item.soldWorld || 0) * unitCostUSDT;
+    return totals;
+  }, moneyBag());
+  const averageOrderValue = moneyBag(
+    soldByCurrency.BDT ? revenue.BDT / soldByCurrency.BDT : 0,
+    soldByCurrency.PKR ? revenue.PKR / soldByCurrency.PKR : 0,
+    soldByCurrency.USDT ? revenue.USDT / soldByCurrency.USDT : 0
+  );
 
   res.json({
     stats: {
@@ -222,7 +274,12 @@ adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
       deliveredOrders,
       rejectedOrders,
       soldOrders: approvedOrders + deliveredOrders,
-      availableStock
+      totalOrders: pendingOrders + approvedOrders + deliveredOrders + rejectedOrders,
+      availableStock,
+      lowStockProducts: lowStockAgg.length,
+      revenue,
+      profit,
+      averageOrderValue
     },
     salesByProduct,
     lowStock: lowStockAgg.map(x => ({ productId: x._id?.toString(), productName: productMap.get(x._id?.toString())?.title || 'Unknown product', available: x.available })),
