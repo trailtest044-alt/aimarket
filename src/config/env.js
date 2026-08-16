@@ -22,6 +22,21 @@ export const env = {
   jwtSecret: process.env.JWT_SECRET,
   googleClientId: process.env.GOOGLE_CLIENT_ID || '',
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+  mail: {
+    host: process.env.SMTP_HOST || '',
+    port: Number(process.env.SMTP_PORT || 465),
+    secure: process.env.SMTP_SECURE !== 'false',
+    user: process.env.SMTP_USER || '',
+    password: process.env.SMTP_PASSWORD || '',
+    from: process.env.EMAIL_FROM || 'Ai Market',
+    replyTo: process.env.EMAIL_REPLY_TO || process.env.SMTP_USER || ''
+  },
+  telegram: {
+    token: process.env.TELEGRAM_BOT_TOKEN || '',
+    adminChatId: process.env.TELEGRAM_ADMIN_CHAT_ID || '',
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
+    lowStockLimit: Math.max(0, Number(process.env.TELEGRAM_LOW_STOCK_LIMIT || 1))
+  },
   adminSeedSecret: process.env.ADMIN_SEED_SECRET,
   encryptionKey
 };

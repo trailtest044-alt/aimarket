@@ -22,3 +22,11 @@ export const adminLoginLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Try again later.' }
 });
+
+// Customer authentication is Google-only. Keep old email-auth URLs closed so
+// a stale client cannot re-enable the retired login method.
+export function emailLoginStartLimiter(req, res) {
+  return res.status(404).json({ error: 'Email login is disabled. Continue with Google.' });
+}
+
+export const emailLoginVerifyLimiter = emailLoginStartLimiter;

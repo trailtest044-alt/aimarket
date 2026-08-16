@@ -6,7 +6,21 @@ const orderSchema = new mongoose.Schema({
   customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', default: null, index: true },
   productSnapshot: {
     title: String,
+    logoUrl: { type: String, default: '' },
+    icon: { type: String, default: '✨' },
+    deliveryMode: { type: String, default: 'credentials' },
+    manualInputMode: { type: String, default: 'ideogram_credentials' },
+    backorder: { type: Boolean, default: false },
+    deliveryInstruction: { type: String, default: '' },
+    deliveryVideoUrl: { type: String, default: '' },
+    deliveryImageUrl: { type: String, default: '' },
     price: Number,
+    originalAmount: { type: Number, default: 0 },
+    discountAmount: { type: Number, default: 0 },
+    purchaseCost: { type: Number, default: 0 },
+    accountCost: { type: Number, default: 0 },
+    paymentGatewayFee: { type: Number, default: 0 },
+    otherExpense: { type: Number, default: 0 },
     currency: String,
     priceRegion: { type: String, enum: ['bd', 'pk', 'world'], default: 'world' }
   },
@@ -15,13 +29,13 @@ const orderSchema = new mongoose.Schema({
     email: { type: String, required: true, lowercase: true, trim: true },
     whatsapp: { type: String, default: '' }
   },
-  paymentMethod: { type: String, enum: ['bangladesh', 'pakistan', 'binance'], required: true },
+  paymentMethod: { type: String, enum: ['bangladesh', 'pakistan', 'binance', 'reseller_due', 'free'], required: true },
   priceRegion: { type: String, enum: ['bd', 'pk', 'world'], default: 'world', index: true },
   detectedCountry: { type: String, default: 'XX' },
-  transactionId: { type: String, required: true, trim: true },
+  transactionId: { type: String, default: '', trim: true },
   paymentNote: String,
   customerOrderRef: { type: String, default: '' },
-  status: { type: String, enum: ['pending', 'approved', 'rejected', 'delivered'], default: 'pending', index: true },
+  status: { type: String, enum: ['pending', 'approved', 'rejected', 'delivered', 'cancelled'], default: 'pending', index: true },
   accessTokenHash: { type: String, required: true },
   assignedStockItemId: { type: mongoose.Schema.Types.ObjectId, ref: 'StockItem', default: null },
   reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', default: null },
@@ -40,10 +54,8 @@ const orderSchema = new mongoose.Schema({
   deliveryViewedAt: Date,
   ipAddress: String,
   userAgent: String
-}, { timestamps: true });
+}, { timestamps: true, strict: false });
 
 orderSchema.index({ 'customer.email': 1, createdAt: -1 });
 orderSchema.index({ status: 1, createdAt: -1 });
-orderSchema.index({ transactionId: 1, paymentMethod: 1 }, { unique: true });
-
 export const Order = mongoose.model('Order', orderSchema);

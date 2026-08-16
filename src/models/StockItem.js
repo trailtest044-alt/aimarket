@@ -22,7 +22,7 @@ const stockItemSchema = new mongoose.Schema({
   adminNote: String,
   createdByAdminId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', default: null },
   createdByNickname: { type: String, default: '' }
-}, { timestamps: true });
+}, { timestamps: true, strict: false });
 
 stockItemSchema.index({ productId: 1, status: 1, createdAt: 1 });
 

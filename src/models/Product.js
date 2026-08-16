@@ -53,7 +53,7 @@ const productSchema = new mongoose.Schema({
   createdByNickname: { type: String, default: '' },
   updatedByAdminId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', default: null },
   updatedByNickname: { type: String, default: '' }
-}, { timestamps: true });
+}, { timestamps: true, strict: false });
 
 productSchema.index({ isActive: 1, sortOrder: 1, createdAt: -1 });
 
