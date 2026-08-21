@@ -38,6 +38,11 @@ const orderSchema = new mongoose.Schema({
   status: { type: String, enum: ['pending', 'approved', 'rejected', 'delivered', 'cancelled'], default: 'pending', index: true },
   accessTokenHash: { type: String, required: true },
   assignedStockItemId: { type: mongoose.Schema.Types.ObjectId, ref: 'StockItem', default: null },
+  fulfillment: {
+    isBackorder: { type: Boolean, default: false },
+    deliveryDetailsAddedAt: { type: Date, default: null },
+    deliveryDetailsAddedByNickname: { type: String, default: '' }
+  },
   reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', default: null },
   reviewedByNickname: { type: String, default: '' },
   reviewedAt: Date,

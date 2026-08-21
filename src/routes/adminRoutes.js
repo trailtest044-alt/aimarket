@@ -1816,16 +1816,26 @@ adminRouter.post('/orders/:orderId/delivery-details', asyncHandler(async (req, r
     createdByAdminId: req.admin._id,
     createdByNickname: req.admin.nickname || req.admin.name
   });
-  order.assignedStockItemId = stock._id;
-  order.fulfillment = {
-    ...(order.fulfillment || {}),
-    isBackorder: Boolean(order.fulfillment?.isBackorder),
-    deliveryDetailsAddedAt: new Date(),
-    deliveryDetailsAddedByNickname: req.admin.nickname || req.admin.name
-  };
-  await order.save();
+  // Persist the stock assignment and the UI unlock flag atomically. Besides
+  // making the nested fulfillment fields reliable, the pending/null guard
+  // prevents two admins from attaching different details at the same time.
+  const updatedOrder = await Order.findOneAndUpdate(
+    { _id: order._id, status: 'pending', assignedStockItemId: null },
+    { $set: {
+      assignedStockItemId: stock._id,
+      'fulfillment.isBackorder': true,
+      'fulfillment.deliveryDetailsAddedAt': new Date(),
+      'fulfillment.deliveryDetailsAddedByNickname': req.admin.nickname || req.admin.name
+    } },
+    { new: true, runValidators: true }
+  );
+  if (!updatedOrder) {
+    // This stock row was created by this request only and was never assigned.
+    await StockItem.deleteOne({ _id: stock._id, status: 'reserved', assignedOrderId: order._id });
+    return res.status(409).json({ error: 'This order changed while delivery details were being saved. Refresh and try again.' });
+  }
   await logActivity(req.admin, 'order.delivery_details_added', 'order', order.orderId, `${req.admin.nickname || req.admin.name} added delivery details for ${order.orderId}`);
-  res.status(201).json({ message: 'Delivery details added. Approval and delivery are now unlocked.', order, stock: { ...stock.toObject(), encryptedPayload: undefined } });
+  res.status(201).json({ message: 'Delivery details added. Approval and delivery are now unlocked.', order: updatedOrder, stock: { ...stock.toObject(), encryptedPayload: undefined } });
 }));
 
 adminRouter.post('/orders/:orderId/approve', asyncHandler(async (req, res) => {
