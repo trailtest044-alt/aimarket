@@ -3,10 +3,7 @@ export function normalizeCountryCode(value) {
 }
 
 export function regionFromCountry(countryCode) {
-  const code = normalizeCountryCode(countryCode);
-  if (code === 'BD') return 'bd';
-  if (code === 'PK') return 'pk';
-  return 'world';
+  return 'pk';
 }
 
 export function detectCountry(req) {
@@ -23,31 +20,19 @@ export function detectCountry(req) {
 
 export function detectRegion(req, requestedRegion) {
   const country = detectCountry(req);
-  const headerRegion = regionFromCountry(country);
-  const requested = ['bd', 'pk', 'world'].includes(requestedRegion) ? requestedRegion : undefined;
-  // If the hosting proxy did not provide a country header, use the frontend-detected region.
-  const region = country === 'XX' && requested ? requested : headerRegion;
-  return { country, region };
+  return { country, region: 'pk' };
 }
 
 export function priceForRegion(product, region) {
-  if (region === 'bd') return { amount: Number(product.priceBDT || 0), currency: 'BDT' };
-  if (region === 'pk') return { amount: Number(product.pricePKR || 0), currency: 'PKR' };
-  return { amount: Number(product.priceUSDT || 0), currency: product.worldwideCurrency || 'USDT' };
+  return { amount: Number(product.pricePKR || 0), currency: 'PKR' };
 }
 
 export function allowedPaymentMethods(region) {
-  // Bangladesh customers see only Bangladesh gateway.
-  // Pakistan and worldwide customers can choose Pakistan payment or Binance.
-  if (region === 'bd') return ['bangladesh'];
-  return ['pakistan', 'binance'];
+  return ['pakistan'];
 }
 
 export function priceRegionForPaymentMethod(paymentMethod, detectedRegion = 'world') {
-  if (paymentMethod === 'bangladesh') return 'bd';
-  if (paymentMethod === 'pakistan') return 'pk';
-  if (paymentMethod === 'binance') return 'world';
-  return detectedRegion || 'world';
+  return 'pk';
 }
 
 export function expectedPaymentMethod(region) {

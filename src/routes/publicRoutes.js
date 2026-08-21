@@ -74,8 +74,8 @@ const createOrderSchema = z.object({
     email: z.string().email().max(120),
     whatsapp: z.string().max(40).optional().default('')
   }),
-  paymentMethod: z.enum(['bangladesh', 'pakistan', 'binance', 'reseller_due', 'free']),
-  priceRegion: z.enum(['bd', 'pk', 'world']).optional().default('world'),
+  paymentMethod: z.literal('pakistan'),
+  priceRegion: z.literal('pk').optional().default('pk'),
   transactionId: z.string().max(120).optional().default(''),
   customerOrderRef: z.string().max(120).optional().default(''),
   paymentNote: z.string().max(500).optional().default(''),
@@ -99,8 +99,8 @@ const createOrderBatchSchema = z.object({
     email: z.string().email().max(120),
     whatsapp: z.string().max(40).optional().default('')
   }),
-  paymentMethod: z.enum(['bangladesh', 'pakistan', 'binance', 'reseller_due', 'free']),
-  priceRegion: z.enum(['bd', 'pk', 'world']).optional().default('world'),
+  paymentMethod: z.literal('pakistan'),
+  priceRegion: z.literal('pk').optional().default('pk'),
   transactionId: z.string().max(120).optional().default(''),
   customerOrderRef: z.string().max(120).optional().default(''),
   paymentNote: z.string().max(500).optional().default(''),
@@ -295,29 +295,25 @@ function resellerPriceForRegion(access, product, region) {
 
 function publicProduct(p, availableStock, region = 'world', access = null) {
   const {
-    pricePKR, originalPricePKR, purchaseCostPKR, accountCostPKR,
-    paymentGatewayFeePKR, otherExpensePKR, ...publicBase
+    priceBDT, priceUSDT, originalPriceBDT, originalPriceUSDT,
+    purchaseCostBDT, purchaseCostPKR, purchaseCostUSDT,
+    accountCostBDT, accountCostPKR, accountCostUSDT,
+    paymentGatewayFeeBDT, paymentGatewayFeePKR, paymentGatewayFeeUSDT,
+    otherExpenseBDT, otherExpensePKR, otherExpenseUSDT,
+    worldwideCurrency, isFree, ...publicBase
   } = p;
-  const displayPrice = access ? resellerPriceForRegion(access, p, region) : priceForRegion(p, region);
-  const bdPrice = access?.priceBDT ?? p.priceBDT;
-  const worldPrice = access?.priceUSDT ?? p.priceUSDT;
+  const pkPrice = Number(p.pricePKR || 0);
   return {
     ...publicBase,
-    // The checkout reads the regional fields below. For a reseller, return
-    // their assigned prices there as well as in displayPrice; otherwise the
-    // card can show the custom price while checkout falls back to the retail
-    // price from the original product record.
-    priceBDT: Number(bdPrice || 0),
-    priceUSDT: Number(worldPrice || 0),
+    pricePKR: pkPrice,
     pricing: {
-      bd: { amount: Number(bdPrice || 0), currency: 'BDT', originalAmount: Number(p.originalPriceBDT || 0) },
-      world: { amount: Number(worldPrice || 0), currency: 'USDT', originalAmount: Number(p.originalPriceUSDT || 0) }
+      pk: { amount: Number(pkPrice || 0), currency: 'PKR', originalAmount: Number(p.originalPricePKR || 0) },
     },
-    displayPrice: { ...displayPrice, region },
+    displayPrice: { amount: pkPrice, currency: 'PKR', region: 'pk' },
     availableStock: availableStock || 0,
     actualStock: Number(p.actualStock || 0),
     backorderAvailable: Number(p.backorderAvailable || 0),
-    resellerPrice: Boolean(access)
+    resellerPrice: false
   };
 }
 
@@ -326,7 +322,7 @@ function configuredBackorder(product) {
 }
 
 function isFreeProductPrice(product, price) {
-  return product?.isFree === true || Number(price?.amount ?? 0) <= 0;
+  return false;
 }
 
 function customerFreeOrderQuery(customer) {
@@ -489,10 +485,7 @@ function queueNewOrderNotification(order) {
 }
 
 async function activeResellerForCustomer(customer) {
-  if (!customer) return null;
-  const email = String(customer.email || '').toLowerCase();
-  const reseller = await Reseller.findOne({ $or: [{ customerId: customer._id }, { email }] });
-  return reseller?.status === 'active' ? reseller : null;
+  return null;
 }
 
 function ledgerBalances(entries) {
@@ -505,13 +498,11 @@ function ledgerBalances(entries) {
 }
 
 function promoAmountFields(region) {
-  if (region === 'bd') return { fixed: 'fixedBDT', min: 'minAmountBDT' };
-  return { fixed: 'fixedUSDT', min: 'minAmountUSDT' };
+  return { fixed: 'fixedPKR', min: 'minAmountPKR' };
 }
 
 function costSuffixForRegion(region) {
-  if (region === 'bd') return 'BDT';
-  return 'USDT';
+  return 'PKR';
 }
 
 function productCostForRegion(product, region, field) {
@@ -596,6 +587,8 @@ publicRouter.post('/analytics/visit', asyncHandler(async (req, res) => {
   }
   res.status(204).end();
 }));
+
+publicRouter.use('/auth', (req, res) => res.status(404).json({ error: 'Customer login is not required or available.' }));
 
 publicRouter.get('/auth/google/start', asyncHandler(async (req, res) => {
   requireGoogleConfig();
@@ -704,6 +697,8 @@ publicRouter.post('/auth/email/verify', emailLoginVerifyLimiter, asyncHandler(as
 publicRouter.get('/auth/customer/me', requireCustomer, asyncHandler(async (req, res) => {
   res.json({ customer: customerSafe(req.customer) });
 }));
+
+publicRouter.use('/reseller', (req, res) => res.status(404).json({ error: 'Reseller features are not available.' }));
 
 publicRouter.get('/reseller/me', requireCustomer, asyncHandler(async (req, res) => {
   const reseller = await activeResellerForCustomer(req.customer);
@@ -859,7 +854,7 @@ publicRouter.get('/products/:slug', optionalCustomer, asyncHandler(async (req, r
 }));
 
 publicRouter.get('/payment-methods', asyncHandler(async (req, res) => {
-  const methods = await PaymentMethod.find({ isActive: true, key: { $in: ['bangladesh', 'pakistan', 'binance'] } }).sort({ key: 1 }).lean();
+  const methods = await PaymentMethod.find({ isActive: true, key: 'pakistan' }).sort({ key: 1 }).lean();
   res.json({ methods });
 }));
 
@@ -912,7 +907,7 @@ publicRouter.get('/promo/homepage', optionalCustomer, asyncHandler(async (req, r
   })) });
 }));
 
-publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (req, res) => {
+publicRouter.post('/orders', orderLimiter, optionalCustomer, asyncHandler(async (req, res) => {
   const data = createOrderSchema.parse(req.body);
 
   if (!validator.isMongoId(data.productId)) {
@@ -941,6 +936,7 @@ publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (
   const access = requestedResellerOrder ? await ResellerProductAccess.findOne({ resellerId: reseller._id, productId: product._id, isVisible: true }).lean() : null;
   if (requestedResellerOrder && !access) return res.status(403).json({ error: 'This product is not available for this reseller' });
   const price = requestedResellerOrder ? resellerPriceForRegion(access, product, finalPriceRegion) : priceForRegion(product, finalPriceRegion);
+  if (Number(price.amount || 0) <= 0) return res.status(409).json({ error: 'This product needs a valid PKR price before it can be purchased.' });
   const isFreeOrder = isFreeProductPrice(product, price);
   let freeClaimLock = null;
   if (data.paymentMethod === 'free' && !isFreeOrder) return res.status(400).json({ error: 'Free checkout is available only for products with a zero price.' });
@@ -1004,8 +1000,8 @@ publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (
       otherExpense: productCostForRegion(product, finalPriceRegion, 'otherExpense')
     },
     customer: {
-      name: data.customer.name.trim() || req.customer.name || '',
-      email: req.customer.email,
+      name: data.customer.name.trim(),
+      email: data.customer.email.toLowerCase().trim(),
       whatsapp: data.customer.whatsapp?.trim() || ''
     },
     paymentMethod: isFreeOrder ? 'free' : (isResellerOrder ? 'reseller_due' : data.paymentMethod),
@@ -1079,19 +1075,17 @@ publicRouter.post('/orders', orderLimiter, requireCustomer, asyncHandler(async (
   });
 }));
 
-publicRouter.post('/orders/batch', orderLimiter, requireCustomer, asyncHandler(async (req, res) => {
+publicRouter.post('/orders/batch', orderLimiter, optionalCustomer, asyncHandler(async (req, res) => {
   const data = createOrderBatchSchema.parse(req.body);
   const checkoutRequestId = data.clientRequestId.trim();
-  const requestKey = checkoutRequestId ? `${req.customer?._id || req.customer?.email}:${checkoutRequestId}` : '';
+  const guestEmail = data.customer.email.toLowerCase().trim();
+  const requestKey = checkoutRequestId ? `${guestEmail}:${checkoutRequestId}` : '';
   let activeKey = '';
   if (checkoutRequestId) {
     if (activeCheckoutRequests.has(requestKey)) {
       return res.status(409).json({ error: 'This order is already being submitted. Please wait a moment.' });
     }
-    const previousOrders = await Order.find({
-      customerId: req.customer?._id || null,
-      checkoutRequestId
-    }).sort({ createdAt: 1 });
+    const previousOrders = await Order.find({ checkoutRequestId, 'customer.email': guestEmail }).sort({ createdAt: 1 });
     if (previousOrders.length) {
       const replayed = [];
       for (const order of previousOrders) {
@@ -1105,12 +1099,12 @@ publicRouter.post('/orders/batch', orderLimiter, requireCustomer, asyncHandler(a
         message: 'This checkout was already submitted. Returning the original order.',
         batchId: replayed[0]?.order.batchId || '',
         totalAmount,
-        currency: replayed[0]?.order.productSnapshot?.currency || 'USDT',
+        currency: replayed[0]?.order.productSnapshot?.currency || 'PKR',
         orders: replayed.map(({ order, accessToken }) => ({
           orderId: order.orderId,
           productTitle: order.productSnapshot?.title || 'Product',
           amount: order.productSnapshot?.price || 0,
-          currency: order.productSnapshot?.currency || 'USDT',
+          currency: order.productSnapshot?.currency || 'PKR',
           status: order.status,
           accessToken
         }))
@@ -1159,6 +1153,7 @@ publicRouter.post('/orders/batch', orderLimiter, requireCustomer, asyncHandler(a
     const access = isResellerOrder ? await ResellerProductAccess.findOne({ resellerId: reseller._id, productId: product._id, isVisible: true }).lean() : null;
     if (isResellerOrder && !access) return res.status(403).json({ error: `${product.title} is not available for this reseller` });
     const price = isResellerOrder ? resellerPriceForRegion(access, product, finalPriceRegion) : priceForRegion(product, finalPriceRegion);
+    if (Number(price.amount || 0) <= 0) return res.status(409).json({ error: `${product.title} needs a valid PKR price before it can be purchased.` });
     const promoResult = await applyPromoToPrice(data.promoCode, product._id, finalPriceRegion, Number(price.amount || 0), { isReseller: Boolean(reseller) });
     const deliveryMode = nextStock?.type || product.deliveryMode || 'credentials';
     const isFree = isFreeProductPrice(product, price);
@@ -1227,7 +1222,7 @@ publicRouter.post('/orders/batch', orderLimiter, requireCustomer, asyncHandler(a
           purchaseCost: productCostForRegion(item.product, finalPriceRegion, 'purchaseCost'), accountCost: productCostForRegion(item.product, finalPriceRegion, 'accountCost'),
           paymentGatewayFee: productCostForRegion(item.product, finalPriceRegion, 'paymentGatewayFee'), otherExpense: productCostForRegion(item.product, finalPriceRegion, 'otherExpense')
         },
-        customer: { name: data.customer.name.trim() || req.customer.name || '', email: req.customer.email, whatsapp: data.customer.whatsapp?.trim() || '' },
+        customer: { name: data.customer.name.trim(), email: guestEmail, whatsapp: data.customer.whatsapp?.trim() || '' },
         paymentMethod: item.isFree ? 'free' : (isResellerOrder ? 'reseller_due' : data.paymentMethod), priceRegion: finalPriceRegion, detectedCountry: country,
         transactionId: item.isFree ? `FREE-${orderId}` : data.transactionId.trim(), customerOrderRef: data.customerOrderRef.trim() || '', paymentNote: data.paymentNote,
         status: 'pending',

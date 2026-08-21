@@ -49,10 +49,10 @@ const productSchema = z.object({
   imageUrl: z.string().max(1000).optional().default(''),
   badge: z.string().max(60).optional().default(''),
   icon: z.string().max(10).optional().default('✨'),
-  priceBDT: z.number().min(0),
-  pricePKR: z.number().min(0),
-  priceUSDT: z.number().min(0),
-  isFree: z.boolean().optional().default(false),
+  priceBDT: z.number().min(0).optional().default(0),
+  pricePKR: z.number().positive(),
+  priceUSDT: z.number().min(0).optional().default(0),
+  isFree: z.literal(false).optional().default(false),
   worldwideCurrency: z.literal('USDT').optional().default('USDT'),
   originalPriceBDT: z.number().min(0).optional().default(0),
   originalPricePKR: z.number().min(0).optional().default(0),
@@ -95,7 +95,7 @@ const createProductSchema = productSchema.extend({
 });
 
 const paymentMethodSchema = z.object({
-  key: z.enum(['bangladesh', 'pakistan', 'binance']),
+  key: z.literal('pakistan'),
   title: z.string().min(2).max(80),
   instructions: z.string().min(5).max(3000),
   accounts: z.array(z.object({
@@ -284,6 +284,51 @@ function isSoldOrder(order) {
   return SOLD_STATUSES.has(order.status);
 }
 
+function adminSaleValues(order, product = null) {
+  const sellingPrice = roundMoney(order.productSnapshot?.price || 0);
+  const snapshotBuying = Number(order.productSnapshot?.purchaseCost || 0);
+  const buyingPrice = roundMoney(snapshotBuying > 0 ? snapshotBuying : Number(product?.purchaseCostPKR || 0));
+  return {
+    sellingPrice,
+    buyingPrice,
+    profit: roundMoney(sellingPrice - buyingPrice)
+  };
+}
+
+async function adminDueSummary(adminId, recentLimit = 10) {
+  const orders = await Order.find({
+    approvedBy: adminId,
+    status: { $in: ['approved', 'delivered'] },
+    adminDueSettledAt: null
+  }).sort({ approvedAt: -1, createdAt: -1 }).lean();
+  const productIds = [...new Set(orders.map((order) => String(order.productId || '')).filter(Boolean))];
+  const products = productIds.length ? await Product.find({ _id: { $in: productIds } }).select('purchaseCostPKR').lean() : [];
+  const productMap = new Map(products.map((product) => [String(product._id), product]));
+
+  const totals = orders.reduce((sum, order) => {
+    const values = adminSaleValues(order, productMap.get(String(order.productId || '')));
+    sum.totalSalesPKR += values.sellingPrice;
+    sum.duePKR += values.buyingPrice;
+    sum.profitPKR += values.profit;
+    return sum;
+  }, { totalSalesPKR: 0, duePKR: 0, profitPKR: 0 });
+
+  return {
+    currency: 'PKR',
+    ...Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, roundMoney(value)])),
+    orderCount: orders.length,
+    recentSales: orders.slice(0, recentLimit).map((order) => ({
+      id: order.orderId,
+      productName: order.productSnapshot?.title || 'Product',
+      customerName: order.customer?.name || '',
+      customerEmail: order.customer?.email || '',
+      status: order.status,
+      approvedAt: order.approvedAt || order.createdAt,
+      ...adminSaleValues(order, productMap.get(String(order.productId || '')))
+    }))
+  };
+}
+
 function normalizeCurrency(value) {
   const upper = String(value || 'USDT').toUpperCase();
   return MONEY_CODES.includes(upper) ? upper : 'USDT';
@@ -348,7 +393,7 @@ function summarizeMoney(orders, productMap) {
     const amount = orderFinalAmount(order);
     const itemDiscount = orderDiscount(order);
     const itemCosts = orderCostBreakdown(order, productMap);
-    const totalCost = Object.values(itemCosts).reduce((sum, value) => sum + Number(value || 0), 0);
+    const totalCost = Number(itemCosts.purchaseCost || 0);
     addMoney(revenue, currency, amount);
     addMoney(profit, currency, amount - totalCost);
     addMoney(discount, currency, itemDiscount);
@@ -592,11 +637,20 @@ adminRouter.post('/auth/login', adminLoginLimiter, asyncHandler(async (req, res)
 
 adminRouter.use(requireAdmin);
 
+adminRouter.use(['/resellers', '/reseller-payment-requests'], (req, res) => {
+  res.status(404).json({ error: 'Reseller features are not available.' });
+});
+
 adminRouter.get('/me', (req, res) => res.json({ admin: req.admin }));
 
 adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
   const mode = ['weekly', 'monthly', 'lifetime', 'custom'].includes(req.query.mode) ? req.query.mode : 'weekly';
   const period = dashboardPeriod(mode, req.query);
+
+  if (req.admin.role !== 'owner') {
+    const staffSummary = await adminDueSummary(req.admin._id, 25);
+    return res.json({ mode: 'staff', period: publicPeriod(period, mode), staffSummary });
+  }
 
   const [products, orders, stockItems, recentActivity, signedUpUsers, visitors] = await Promise.all([
     Product.find({ isDeleted: { $ne: true } }).sort({ sortOrder: 1, createdAt: -1 }).lean(),
@@ -1131,7 +1185,52 @@ adminRouter.get('/customers/orders/:orderId/delivery', asyncHandler(async (req, 
 // Owner-only admin management
 adminRouter.get('/users', requireOwner, asyncHandler(async (req, res) => {
   const admins = await Admin.find().sort({ role: -1, createdAt: -1 }).select('-passwordHash').lean();
-  res.json({ admins: admins.map(adminSafe) });
+  const rows = await Promise.all(admins.map(async (admin) => ({
+    ...adminSafe(admin),
+    ...(admin.role === 'owner' ? { currency: 'PKR', totalSalesPKR: 0, duePKR: 0, profitPKR: 0, orderCount: 0 } : await adminDueSummary(admin._id, 0))
+  })));
+  res.json({ admins: rows });
+}));
+
+adminRouter.post('/users/:id/due/clear', requireOwner, asyncHandler(async (req, res) => {
+  if (!validator.isMongoId(req.params.id)) return res.status(400).json({ error: 'Invalid admin ID' });
+  const admin = await Admin.findById(req.params.id).lean();
+  if (!admin) return res.status(404).json({ error: 'Admin not found' });
+  if (admin.role === 'owner') return res.status(400).json({ error: 'Owner does not have an admin due balance.' });
+
+  const settledAt = new Date();
+  const settlementId = `ADMIN-${Date.now()}-${String(admin._id).slice(-6)}`;
+  const filter = {
+    approvedBy: admin._id,
+    status: { $in: ['approved', 'delivered'] },
+    adminDueSettledAt: null
+  };
+  await Order.updateMany(filter, { $set: {
+    adminSettlementId: settlementId,
+    adminDueSettledAt: settledAt,
+    adminDueSettledBy: req.admin._id,
+    adminDueSettledByNickname: req.admin.nickname || req.admin.name
+  } });
+
+  const settledOrders = await Order.find({ adminSettlementId: settlementId }).lean();
+  const productIds = [...new Set(settledOrders.map((order) => String(order.productId || '')).filter(Boolean))];
+  const products = productIds.length ? await Product.find({ _id: { $in: productIds } }).select('purchaseCostPKR').lean() : [];
+  const productMap = new Map(products.map((product) => [String(product._id), product]));
+  const totals = settledOrders.reduce((sum, order) => {
+    const values = adminSaleValues(order, productMap.get(String(order.productId || '')));
+    sum.totalSalesPKR += values.sellingPrice;
+    sum.duePKR += values.buyingPrice;
+    sum.profitPKR += values.profit;
+    return sum;
+  }, { totalSalesPKR: 0, duePKR: 0, profitPKR: 0 });
+  Object.keys(totals).forEach((key) => { totals[key] = roundMoney(totals[key]); });
+
+  await logActivity(req.admin, 'admin.due_cleared', 'admin', admin._id, `${req.admin.nickname || req.admin.name} cleared ${admin.nickname || admin.name}'s PKR ${totals.duePKR} due`, {
+    settlementId,
+    orderCount: settledOrders.length,
+    ...totals
+  });
+  res.json({ settlementId, settledAt, orderCount: settledOrders.length, ...totals });
 }));
 
 adminRouter.post('/users', requireOwner, asyncHandler(async (req, res) => {
@@ -1272,7 +1371,7 @@ adminRouter.delete('/products/:id', asyncHandler(async (req, res) => {
 
 // Payment methods
 adminRouter.get('/payment-methods', asyncHandler(async (req, res) => {
-  const methods = await PaymentMethod.find().sort({ key: 1 }).lean();
+  const methods = await PaymentMethod.find({ key: 'pakistan' }).sort({ key: 1 }).lean();
   res.json({ methods });
 }));
 
