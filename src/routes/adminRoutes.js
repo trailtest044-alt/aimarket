@@ -648,8 +648,16 @@ adminRouter.get('/dashboard', asyncHandler(async (req, res) => {
   const period = dashboardPeriod(mode, req.query);
 
   if (req.admin.role !== 'owner') {
-    const staffSummary = await adminDueSummary(req.admin._id, 25);
-    return res.json({ mode: 'staff', period: publicPeriod(period, mode), staffSummary });
+    const [staffSummary, pendingOrders] = await Promise.all([
+      adminDueSummary(req.admin._id, 25),
+      Order.countDocuments({ status: 'pending' })
+    ]);
+    return res.json({
+      mode: 'staff',
+      period: publicPeriod(period, mode),
+      staffSummary,
+      stats: { pendingOrders }
+    });
   }
 
   const [products, orders, stockItems, recentActivity, signedUpUsers, visitors] = await Promise.all([
