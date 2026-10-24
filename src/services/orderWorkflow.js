@@ -3,9 +3,10 @@ import { StockItem } from '../models/StockItem.js';
 import { Reseller } from '../models/Reseller.js';
 import { ResellerInvoice } from '../models/ResellerInvoice.js';
 import { ResellerLedger } from '../models/ResellerLedger.js';
-import { decryptJson } from '../utils/cryptoBox.js';
+import { decryptJson, encryptJson } from '../utils/cryptoBox.js';
 import { logActivity } from '../utils/activity.js';
 import { sendDeliveryEmail } from './notificationEmail.js';
+import { cancelPlandawReservation, fetchPlandawDelivery } from './plandawSupplier.js';
 
 function actorName(admin) {
   return admin?.nickname || admin?.name || 'System';
@@ -103,6 +104,37 @@ async function assignDeliveryStock(order, admin) {
   return stock;
 }
 
+async function importSupplierDelivery(order, admin) {
+  if (order.assignedStockItemId || order.supplier?.provider !== 'plandaw') return null;
+  // Recover an imported stock item if saving its order link previously failed.
+  const imported = await StockItem.findOne({ assignedOrderId: order._id, adminNote: 'Imported securely from Plandaw Partner API' });
+  if (imported) {
+    order.assignedStockItemId = imported._id;
+    await order.save();
+    return imported;
+  }
+  const delivery = await fetchPlandawDelivery(order);
+  if (!delivery) throw new Error('Plandaw delivery details were not returned. Retry after checking supplier stock.');
+  const type = ['credentials', 'activation_code', 'login_code', 'manual', 'instruction'].includes(delivery.deliveryMode)
+    ? delivery.deliveryMode
+    : 'credentials';
+  const stock = await StockItem.create({
+    productId: order.productId,
+    type,
+    encryptedPayload: encryptJson(delivery),
+    status: 'delivered',
+    assignedOrderId: order._id,
+    deliveredAt: new Date(),
+    adminNote: 'Imported securely from Plandaw Partner API',
+    createdByAdminId: admin?._id || null,
+    createdByNickname: actorName(admin)
+  });
+  order.assignedStockItemId = stock._id;
+  order.fulfillment = { ...(order.fulfillment?.toObject?.() || order.fulfillment || {}), isBackorder: false, deliveryDetailsAddedAt: new Date(), deliveryDetailsAddedByNickname: 'Plandaw Partner API' };
+  await order.save();
+  return stock;
+}
+
 export async function approveOrder({ orderId, admin, source = 'admin' }) {
   const order = await Order.findOne({ orderId });
   if (!order) throw new Error('Order not found');
@@ -110,7 +142,8 @@ export async function approveOrder({ orderId, admin, source = 'admin' }) {
   if (order.productSnapshot?.deliveryMode === 'manual' && !order.manualActivationActivatedAt) {
     throw new Error('Open customer login details and confirm Subscription activated first');
   }
-  const stock = await assignDeliveryStock(order, admin);
+  const supplierStock = await importSupplierDelivery(order, admin);
+  const stock = supplierStock || await assignDeliveryStock(order, admin);
   const nick = actorName(admin);
   order.status = 'approved';
   order.assignedStockItemId = stock._id;
@@ -131,6 +164,7 @@ export async function rejectOrder({ orderId, admin, reason = 'Rejected via admin
   const order = await Order.findOne({ orderId });
   if (!order) throw new Error('Order not found');
   if (order.status !== 'pending') throw new Error('Order is already ' + order.status);
+  await cancelPlandawReservation(order);
   const nick = actorName(admin);
   order.status = 'rejected';
   order.rejectReason = String(reason).slice(0, 500);
@@ -210,7 +244,7 @@ export async function markOrderDelivered({ orderId, admin, source = 'admin' }) {
   const nick = actorName(admin);
   let stock = null;
   if (order.status === 'pending') {
-    stock = await assignDeliveryStock(order, admin);
+    stock = await importSupplierDelivery(order, admin) || await assignDeliveryStock(order, admin);
     order.assignedStockItemId = stock._id;
     order.approvedBy = admin?._id || null;
     order.approvedByNickname = nick;

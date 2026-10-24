@@ -9,6 +9,8 @@ const productSchema = new mongoose.Schema({
   imageUrl: { type: String, default: '' },
   badge: { type: String, default: '' },
   icon: { type: String, default: '✨' },
+  supplierProductId: { type: String, default: '', trim: true, index: true },
+  supplierPackageId: { type: String, default: '', trim: true },
   priceBDT: { type: Number, required: true, min: 0 },
   pricePKR: { type: Number, required: true, min: 0 },
   priceUSDT: { type: Number, required: true, min: 0 },

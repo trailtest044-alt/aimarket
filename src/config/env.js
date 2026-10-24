@@ -37,6 +37,11 @@ export const env = {
     webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
     lowStockLimit: Math.max(0, Number(process.env.TELEGRAM_LOW_STOCK_LIMIT || 1))
   },
+  plandawSupplier: {
+    apiUrl: (process.env.PLANDAW_PARTNER_API_URL || 'https://api.plandaw.com/api/partner/v1').replace(/\/$/, ''),
+    apiKey: process.env.PLANDAW_PARTNER_API_KEY || '',
+    timeoutMs: Math.max(3000, Number(process.env.PLANDAW_PARTNER_TIMEOUT_MS || 12000))
+  },
   adminSeedSecret: process.env.ADMIN_SEED_SECRET,
   encryptionKey
 };

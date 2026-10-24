@@ -10,6 +10,7 @@ import { errorHandler, notFound } from './middleware/errorHandler.js';
 import { publicRouter } from './routes/publicRoutes.js';
 import { adminRouter } from './routes/adminRoutes.js';
 import { Admin } from './models/Admin.js';
+import { startSupplierSync } from './services/supplierSync.js';
 
 const app = express();
 
@@ -75,6 +76,7 @@ app.use(errorHandler);
 
 connectDb()
   .then(() => {
+    startSupplierSync();
     app.listen(env.port, () => {
       console.log(`API running on port ${env.port}`);
     });

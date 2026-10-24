@@ -25,3 +25,9 @@ services:
         generateValue: true
       - key: ENCRYPTION_KEY_BASE64
         sync: false
+      - key: PLANDAW_PARTNER_API_URL
+        sync: false
+      - key: PLANDAW_PARTNER_API_KEY
+        sync: false
+      - key: PLANDAW_PARTNER_TIMEOUT_MS
+        value: 12000

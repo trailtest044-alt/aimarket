@@ -27,6 +27,9 @@ import { notifyOrderApproved, notifyOrderDelivered, notifyResellerPaymentApprove
 import { approveOrder, markOrderDelivered, cancelApprovedOrder } from '../services/orderWorkflow.js';
 import { settleResellerPayment } from '../services/resellerPaymentSettlement.js';
 import { getLatestMailTxtLoginCode } from '../services/mailTxtLoginCode.js';
+import { runSupplierSync } from '../services/supplierSync.js';
+import { SupplierSyncState } from '../models/SupplierSyncState.js';
+import { supplierEnabled } from '../services/plandawSupplier.js';
 
 export const adminRouter = express.Router();
 
@@ -49,6 +52,8 @@ const productSchema = z.object({
   imageUrl: z.string().max(1000).optional().default(''),
   badge: z.string().max(60).optional().default(''),
   icon: z.string().max(10).optional().default('✨'),
+  supplierProductId: z.string().max(80).optional().default(''),
+  supplierPackageId: z.string().max(80).optional().default(''),
   priceBDT: z.number().min(0).optional().default(0),
   pricePKR: z.number().positive(),
   priceUSDT: z.number().min(0).optional().default(0),
@@ -636,6 +641,12 @@ adminRouter.post('/auth/login', adminLoginLimiter, asyncHandler(async (req, res)
 }));
 
 adminRouter.use(requireAdmin);
+adminRouter.get('/supplier-sync', asyncHandler(async (req, res) => {
+  res.json({ configured: supplierEnabled(), state: await SupplierSyncState.findById('plandaw').lean() });
+}));
+adminRouter.post('/supplier-sync/retry', requireOwner, asyncHandler(async (req, res) => {
+  res.json(await runSupplierSync({ force: true }));
+}));
 
 adminRouter.use(['/resellers', '/reseller-payment-requests'], (req, res) => {
   res.status(404).json({ error: 'Reseller features are not available.' });
