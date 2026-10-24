@@ -28,6 +28,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
 import { queueCustomerLoginCode } from '../services/notificationEmail.js';
 import { plandawCatalogSnapshot, reservePlandawStock } from '../services/plandawSupplier.js';
+import { shouldUseSupplierFallback, storefrontSellableStock, supplierReservationNeedsBackorder } from '../services/stockPolicy.js';
 
 export const publicRouter = express.Router();
 const activeCheckoutRequests = new Set();
@@ -320,6 +321,19 @@ function publicProduct(p, availableStock, region = 'world', access = null) {
 
 function configuredBackorder(product) {
   return Math.max(0, Math.floor(Number(product?.backorderStock || 0)));
+}
+
+async function markSupplierFallbackAsBackorder(order, reservation) {
+  if (!supplierReservationNeedsBackorder(reservation)) return order;
+  order.productSnapshot.backorder = true;
+  order.fulfillment = {
+    ...(order.fulfillment?.toObject?.() || order.fulfillment || {}),
+    isBackorder: true,
+    deliveryDetailsAddedAt: null,
+    note: 'Plandaw stock unavailable. Waiting for admin delivery details'
+  };
+  await order.save();
+  return order;
 }
 
 function isFreeProductPrice(product, price) {
@@ -837,8 +851,9 @@ publicRouter.get('/products', optionalCustomer, asyncHandler(async (req, res) =>
     const actualStock = Number(stockMap.get(p._id.toString()) || 0);
     const backorderAvailable = Math.max(0, configuredBackorder(p) - Number(pendingBackorderMap.get(p._id.toString()) || 0));
     const deliveryMode = nextStockTypeMap.get(p._id.toString()) || p.deliveryMode;
-    const supplierAvailable = p.supplierProductId ? Number(supplierStock.get(`${p.supplierProductId}:${p.supplierPackageId || ''}`) || 0) : actualStock + backorderAvailable;
-    return publicProduct({ ...p, actualStock, backorderAvailable, deliveryMode }, supplierAvailable, region, accessMap.get(String(p._id)) || null);
+    const supplierAvailable = p.supplierProductId ? Number(supplierStock.get(`${p.supplierProductId}:${p.supplierPackageId || ''}`) || 0) : 0;
+    const available = storefrontSellableStock({ actualStock, backorderAvailable, supplierStock: supplierAvailable, supplierLinked: Boolean(p.supplierProductId) });
+    return publicProduct({ ...p, actualStock, backorderAvailable, deliveryMode }, available, region, accessMap.get(String(p._id)) || null);
   }), region, reseller: reseller ? { active: true, name: reseller.name || req.customer?.name || '', email: reseller.email } : null });
 }));
 
@@ -856,7 +871,8 @@ publicRouter.get('/products/:slug', optionalCustomer, asyncHandler(async (req, r
   ]);
   const supplierStock = new Map(supplierCatalog.products.map((item) => [`${item.productId}:${item.packageId || ''}`, Number(item.availableStock || 0)]));
   const deliveryMode = nextStock?.type || product.deliveryMode;
-  const available = product.supplierProductId ? Number(supplierStock.get(`${product.supplierProductId}:${product.supplierPackageId || ''}`) || 0) : capacity.sellable;
+  const supplierAvailable = product.supplierProductId ? Number(supplierStock.get(`${product.supplierProductId}:${product.supplierPackageId || ''}`) || 0) : 0;
+  const available = storefrontSellableStock({ actualStock: capacity.actualStock, backorderAvailable: capacity.backorderAvailable, supplierStock: supplierAvailable, supplierLinked: Boolean(product.supplierProductId) });
   res.json({ product: publicProduct({ ...product, actualStock: capacity.actualStock, backorderAvailable: capacity.backorderAvailable, deliveryMode }, available, region, access), region, reseller: reseller ? { active: true, name: reseller.name || req.customer?.name || '', email: reseller.email } : null });
 }));
 
@@ -924,12 +940,17 @@ publicRouter.post('/orders', orderLimiter, optionalCustomer, asyncHandler(async 
   const product = await Product.findOne({ _id: data.productId, isActive: true }).lean();
   if (!product) return res.status(404).json({ error: 'Product not found' });
 
-  const [capacity, nextStock] = await Promise.all([
+  const [capacity, nextStock, supplierCatalog] = await Promise.all([
     stockCapacity(product),
-    nextAvailableStock(product._id)
+    nextAvailableStock(product._id),
+    plandawCatalogSnapshot()
   ]);
-  if (capacity.sellable <= 0 && !product.supplierProductId) return res.status(409).json({ error: 'This product is out of stock' });
-  const isBackorder = capacity.actualStock <= 0 && !product.supplierProductId;
+  const supplierAvailable = product.supplierProductId
+    ? Number(supplierCatalog.products.find((item) => String(item.productId) === String(product.supplierProductId) && String(item.packageId || '') === String(product.supplierPackageId || ''))?.availableStock || 0)
+    : 0;
+  const checkoutAvailable = storefrontSellableStock({ actualStock: capacity.actualStock, backorderAvailable: capacity.backorderAvailable, supplierStock: supplierAvailable, supplierLinked: Boolean(product.supplierProductId) });
+  if (checkoutAvailable <= 0) return res.status(409).json({ error: 'This product is out of stock' });
+  let isBackorder = capacity.actualStock <= 0 && !product.supplierProductId;
   const effectiveDeliveryMode = nextStock?.type || product.deliveryMode || 'credentials';
   const manualDelivery = effectiveDeliveryMode === 'manual';
   const manualValidationError = manualDelivery ? validateManualActivation(data.manualActivation, [product]) : '';
@@ -1025,7 +1046,14 @@ publicRouter.post('/orders', orderLimiter, optionalCustomer, asyncHandler(async 
     ipAddress: req.ip,
     userAgent: req.headers['user-agent'] || ''
   });
-  if (product.supplierProductId) await reservePlandawStock({ order, product });
+  // Always consume Pakistan's own real stock first. Only ask Plandaw when no
+  // local account can fulfil this order. If Plandaw also has no stock, keep the
+  // paid order pending and expose the existing admin/Telegram add-details flow.
+  if (shouldUseSupplierFallback({ actualStock: capacity.actualStock, supplierProductId: product.supplierProductId })) {
+    const reservation = await reservePlandawStock({ order, product });
+    await markSupplierFallbackAsBackorder(order, reservation);
+    isBackorder = !reservation.reserved;
+  }
 
   if (!isFreeOrder && promoResult.promo) {
     await PromoCode.updateOne({ _id: promoResult.promo._id }, { $inc: { usedCount: 1 } });
@@ -1149,6 +1177,7 @@ publicRouter.post('/orders/batch', orderLimiter, optionalCustomer, asyncHandler(
   }
 
   const finalPriceRegion = (isResellerOrder || data.paymentMethod === 'free') ? (['bd', 'pk', 'world'].includes(data.priceRegion) ? data.priceRegion : detectedRegion) : priceRegionForPaymentMethod(data.paymentMethod, detectedRegion);
+  const supplierCatalog = await plandawCatalogSnapshot();
   const prepared = [];
   for (const item of items) {
     const product = await Product.findOne({ _id: item.productId, isActive: true }).lean();
@@ -1157,7 +1186,11 @@ publicRouter.post('/orders/batch', orderLimiter, optionalCustomer, asyncHandler(
       stockCapacity(product),
       nextAvailableStock(product._id)
     ]);
-    if (capacity.sellable < item.quantity && !product.supplierProductId) return res.status(409).json({ error: `${product.title} has only ${capacity.sellable} account(s) available` });
+    const supplierAvailable = product.supplierProductId
+      ? Number(supplierCatalog.products.find((entry) => String(entry.productId) === String(product.supplierProductId) && String(entry.packageId || '') === String(product.supplierPackageId || ''))?.availableStock || 0)
+      : 0;
+    const checkoutAvailable = storefrontSellableStock({ actualStock: capacity.actualStock, backorderAvailable: capacity.backorderAvailable, supplierStock: supplierAvailable, supplierLinked: Boolean(product.supplierProductId) });
+    if (checkoutAvailable < item.quantity) return res.status(409).json({ error: `${product.title} has only ${checkoutAvailable} account(s) available` });
     const access = isResellerOrder ? await ResellerProductAccess.findOne({ resellerId: reseller._id, productId: product._id, isVisible: true }).lean() : null;
     if (isResellerOrder && !access) return res.status(403).json({ error: `${product.title} is not available for this reseller` });
     const price = isResellerOrder ? resellerPriceForRegion(access, product, finalPriceRegion) : priceForRegion(product, finalPriceRegion);
@@ -1211,7 +1244,7 @@ publicRouter.post('/orders/batch', orderLimiter, optionalCustomer, asyncHandler(
   const created = [];
   for (const item of prepared) {
     for (let number = 0; number < item.quantity; number += 1) {
-      const isBackorder = number >= Number(item.actualAvailable || 0) && !item.product.supplierProductId;
+      let isBackorder = number >= Number(item.actualAvailable || 0) && !item.product.supplierProductId;
       const accessToken = createAccessToken();
       const orderId = createOrderId();
       let order = await Order.create({
@@ -1239,7 +1272,11 @@ publicRouter.post('/orders/batch', orderLimiter, optionalCustomer, asyncHandler(
         manualActivationSubmittedAt: item.manualDelivery ? new Date() : null,
         accessTokenHash: sha256(accessToken), ipAddress: req.ip, userAgent: req.headers['user-agent'] || ''
       });
-      if (item.product.supplierProductId) await reservePlandawStock({ order, product: item.product });
+      if (shouldUseSupplierFallback({ actualStock: item.actualAvailable, orderIndex: number, supplierProductId: item.product.supplierProductId })) {
+        const reservation = await reservePlandawStock({ order, product: item.product });
+        await markSupplierFallbackAsBackorder(order, reservation);
+        isBackorder = !reservation.reserved;
+      }
       if (isResellerOrder && !item.isFree) {
         await ResellerLedger.create({ resellerId: reseller._id, orderId: order.orderId, kind: 'order_charge', currency: item.price.currency, amount: item.finalAmount, note: `Reseller order: ${item.product.title}` });
         await ResellerInvoice.create({ resellerId: reseller._id, orderId: order.orderId, productTitle: item.product.title, currency: item.price.currency, originalAmount: item.finalAmount, remainingAmount: item.finalAmount, status: 'open' });
