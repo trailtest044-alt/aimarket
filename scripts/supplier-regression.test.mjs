@@ -47,6 +47,22 @@ test('supplier retry and catalog regressions', async (t) => {
       const order = { orderId: 'TEST-2', supplier: { provider: 'plandaw', status: 'reservation_failed', productId: 'p1' }, save: async () => {} };
       assert.equal((await api.fetchPlandawDelivery(order)).instruction, 'TEST ONLY');
     });
+    await t.test('a successful retry clears the stale Pakistan backorder lock', async () => {
+      const api = await service();
+      globalThis.fetch = async () => ({ ok: true, json: async () => ({ order: { _id: 'partner-2', status: 'stock_reserved' } }) });
+      const order = {
+        orderId: 'TEST-4',
+        customer: { email: 'test@example.com' },
+        productSnapshot: { currency: 'PKR', backorder: true },
+        fulfillment: { isBackorder: true, note: 'Waiting for admin delivery details' },
+        save: async () => {}
+      };
+      const result = await api.reservePlandawStock({ order, product: { supplierProductId: 'p1', supplierPackageId: '' } });
+      assert.equal(result.reserved, true);
+      assert.equal(order.productSnapshot.backorder, false);
+      assert.equal(order.fulfillment.isBackorder, false);
+      assert.match(order.fulfillment.note, /Ready for Pakistan admin approval/);
+    });
     await t.test('missing delivery details never mark an order delivered', async () => {
       const api = await service();
       globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });

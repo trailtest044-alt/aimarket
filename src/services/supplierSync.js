@@ -49,6 +49,7 @@ export async function runSupplierSync({ force = false } = {}) {
     }
     const orders = await Order.find({ $or: [
       { status: 'pending', 'supplier.provider': 'plandaw', 'supplier.status': { $in: ['reservation_failed', 'out_of_stock'] } },
+      { status: 'pending', 'supplier.provider': 'plandaw', 'supplier.status': 'stock_reserved', 'fulfillment.isBackorder': true },
       { 'supplier.cancelPending': true }
     ] }).sort({ 'supplier.lastAttemptAt': 1 }).limit(2);
     for (const order of orders) {

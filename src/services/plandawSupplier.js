@@ -38,6 +38,14 @@ export async function reservePlandawStock({ order, product }) {
       currency: order.productSnapshot?.currency === 'PKR' ? 'PKR' : order.productSnapshot?.currency === 'USDT' ? 'USDT' : 'BDT'
     }) });
     order.supplier = { provider: 'plandaw', productId: product.supplierProductId, packageId: product.supplierPackageId || '', partnerOrderId: result.order?._id || '', externalOrderId: order.orderId, status: result.order?.status || 'stock_reserved', reservedAt: new Date(), lastAttemptAt: new Date(), lastError: '' };
+    if (['stock_reserved', 'delivered'].includes(order.supplier.status)) {
+      if (order.productSnapshot) order.productSnapshot.backorder = false;
+      order.fulfillment = {
+        ...(order.fulfillment?.toObject?.() || order.fulfillment || {}),
+        isBackorder: false,
+        note: 'Plandaw stock reserved. Ready for Pakistan admin approval.'
+      };
+    }
     await order.save();
     return { enabled: true, reserved: ['stock_reserved', 'delivered'].includes(result.order?.status), order: result.order };
   } catch (error) {
